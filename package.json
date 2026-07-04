@@ -1,0 +1,16 @@
+{
+  "name": "p2p-chat-udp",
+  "version": "0.2.0",
+  "type": "module",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node src/main.js"
+  },
+  "dependencies": {
+    "bittorrent-dht": "^7.0.0",
+    "sql.js": "^1.10.3",
+    "tweetnacl": "^1.0.3",
+    "tweetnacl-util": "^0.15.1"
+  },
+  "engines": { "node": ">=18" }
+}

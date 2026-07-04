@@ -1,0 +1,39 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json (可选，但一般建议提交，但我这里不强制)
+
+# 数据库和隐私
+data/
+*.db
+*.db-journal
+
+# 日志
+logs/
+*.log
+
+# 打包文件
+*.exe
+*.dmg
+*.pkg
+*.msi
+*.deb
+*.rpm
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+.kagent
+*.swp
+*.swo
+
+# 临时文件
+tmp/
+temp/
+*.tmp
