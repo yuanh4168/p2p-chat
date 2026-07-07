@@ -1,5 +1,6 @@
 import { getMessage, getMessages, saveMessage } from './db.js';
 import { sha256, toHex, fromHex, verify, aesDecrypt } from './crypto.js';
+import { warn } from './logger.js';
 
 export function getCanonicalData(msg) {
   return {
@@ -30,7 +31,9 @@ export function arePrevIdsValid(prevIds) {
 
 export function storeValidMessage(msg) {
   if (!verifyMessage(msg, fromHex(msg.author))) throw new Error('Invalid signature');
-  if (!arePrevIdsValid(msg.prev_ids || [])) throw new Error('Missing prev messages');
+  if (!arePrevIdsValid(msg.prev_ids || [])) {
+    warn('MESSAGE', 'Missing prev messages, still storing', { id: msg.id });
+  }
   if (computeMessageId(msg) !== msg.id) throw new Error('ID mismatch');
   saveMessage(msg);
   return true;

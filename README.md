@@ -69,29 +69,17 @@ npm install -g pkg
 pkg . --output p2p-chat.exe
 ## 文件结构
 text
-
 ├── data/                # 本地数据库（自动生成）
-
 ├── src/
-
 │   ├── config.js        # 配置（DHT节点、超时等）
-
 │   ├── crypto.js        # 加密工具（Ed25519, X25519, AES）
-
 │   ├── db.js            # SQLite 数据库操作
-
 │   ├── dht.js           # DHT 网络封装
-
 │   ├── group.js         # 群组逻辑（创建、加入、审批）
-
 │   ├── main.js          # 主入口（CLI 交互）
-
 │   ├── message.js       # 消息验证、ID计算
-
 │   └── udp-transport.js # UDP 加密传输 + 握手
-
-├── package.
-
+├── package.json
 └── README.md
 ## 注意事项
 端口要求：UDP 端口需要能被对端访问（NAT 需做端口映射，或使用 Tailscale）。

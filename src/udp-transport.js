@@ -4,227 +4,218 @@ import { createCipheriv, createDecipheriv } from 'crypto';
 import { deriveSharedSecret } from './crypto.js';
 import { UDP_MTU, HANDSHAKE_TIMEOUT, UDP_PORTS } from './config.js';
 import { debug, error, info, warn } from './logger.js';
+import chalk from 'chalk';  // 新增导入
 
 export class UDPTransport extends EventEmitter {
-    constructor(localEd25519KeyPair, localX25519KeyPair) {
-        super();
-        this.localEd25519 = localEd25519KeyPair;
-        this.localX25519 = localX25519KeyPair;
-        this.socket = dgram.createSocket('udp4');
-        this.port = 0;
-        this.sessions = new Map();
-        this.peerAddresses = new Map();
-        this.pendingHandshakes = new Map();
-        this._bind();
-        debug('UDPTransport', 'Transport created');
-    }
+  constructor(localEd25519KeyPair, localX25519KeyPair) {
+    super();
+    this.localEd25519 = localEd25519KeyPair;
+    this.localX25519 = localX25519KeyPair;
+    this.socket = dgram.createSocket('udp4');
+    this.port = 0;
+    this.sessions = new Map();
+    this.peerAddresses = new Map();
+    this.pendingHandshakes = new Map();
+    this._bind();
+    debug('UDPTransport', 'Transport created');
+  }
 
-    _bind() {
-        this.socket.on('message', (buf, rinfo) => this._onMessage(buf, rinfo));
-        // 不再监听 error，由 listen 处理绑定错误，外部处理运行时错误
-        this.socket.on('listening', () => {
-            this.port = this.socket.address().port;
-            info('UDPTransport', 'Socket listening', { port: this.port });
-            this.emit('listening', this.port);
-        });
-    }
+  _bind() {
+    this.socket.on('message', (buf, rinfo) => this._onMessage(buf, rinfo));
+    this.socket.on('listening', () => {
+      this.port = this.socket.address().port;
+      info('UDPTransport', 'Socket listening', { port: this.port });
+      this.emit('listening', this.port);
+    });
+  }
 
-    listen(portList = UDP_PORTS) {
-        return new Promise((resolve, reject) => {
-            if (!Array.isArray(portList)) portList = [portList];
-            let index = 0;
-            const tryBind = () => {
-                if (index >= portList.length) {
-                    reject(new Error('All ports failed to bind'));
-                    return;
-                }
-                const port = portList[index++];
-                info('UDPTransport', 'Attempting to bind', { port });
-                const onError = (err) => {
-                    if (err.code === 'EADDRINUSE') {
-                        warn('UDPTransport', 'Port busy, trying next', { port });
-                        tryBind();
-                    } else {
-                        reject(err);
-                    }
-                };
-                this.socket.once('error', onError);
-                this.socket.bind(port, () => {
-                    // 移除可能残留的 error 监听器
-                    this.socket.removeListener('error', onError);
-                    this.port = this.socket.address().port;
-                    info('UDPTransport', 'Bound successfully', { port: this.port });
-                    resolve(this.port);
-                });
-            };
+  listen(portList = UDP_PORTS) {
+    return new Promise((resolve, reject) => {
+      if (!Array.isArray(portList)) portList = [portList];
+      let index = 0;
+      const tryBind = () => {
+        if (index >= portList.length) {
+          reject(new Error('All ports failed to bind'));
+          return;
+        }
+        const port = portList[index++];
+        info('UDPTransport', 'Attempting to bind', { port });
+        const onError = (err) => {
+          if (err.code === 'EADDRINUSE') {
+            warn('UDPTransport', 'Port busy, trying next', { port });
             tryBind();
+          } else {
+            reject(err);
+          }
+        };
+        this.socket.once('error', onError);
+        this.socket.bind(port, () => {
+          this.socket.removeListener('error', onError);
+          this.port = this.socket.address().port;
+          info('UDPTransport', 'Bound successfully', { port: this.port });
+          resolve(this.port);
         });
-    }
+      };
+      tryBind();
+    });
+  }
 
-    sendTo(ip, port, plaintext) {
-        const key = `${ip}:${port}`;
-        const session = this.sessions.get(key);
-        if (!session || !session.established) {
-            debug('UDPTransport', 'No established session, starting handshake', { ip, port });
-            this._startHandshake(ip, port);
-            return false;
-        }
-        try {
-            const nonce = Buffer.alloc(12);
-            nonce.writeUInt32BE(session.outNonce++, 0);
-            const cipher = createCipheriv('aes-256-gcm', session.sharedKey, nonce);
-            const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-            const authTag = cipher.getAuthTag();
-            const packet = Buffer.concat([nonce, encrypted, authTag]);
-            if (packet.length > UDP_MTU) {
-                warn('UDPTransport', 'Packet too large, not sending', { length: packet.length, mtu: UDP_MTU });
-                return false;
-            }
-            this.socket.send(packet, port, ip);
-            session.lastSeen = Date.now();
-            debug('UDPTransport', 'Sent encrypted data', { ip, port, size: packet.length });
-            return true;
-        } catch (e) {
-            error('UDPTransport', 'Encryption/send error', { error: e.message, ip, port });
-            return false;
-        }
+  sendTo(ip, port, plaintext) {
+    const key = `${ip}:${port}`;
+    const session = this.sessions.get(key);
+    if (!session || !session.established) {
+      debug('UDPTransport', 'No established session, starting handshake', { ip, port });
+      this._startHandshake(ip, port);
+      return false;
     }
+    try {
+      const nonce = Buffer.alloc(12);
+      nonce.writeUInt32BE(session.outNonce++, 0);
+      const cipher = createCipheriv('aes-256-gcm', session.sharedKey, nonce);
+      const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+      const authTag = cipher.getAuthTag();
+      const packet = Buffer.concat([nonce, encrypted, authTag]);
+      if (packet.length > UDP_MTU) {
+        warn('UDPTransport', 'Packet too large, not sending', { length: packet.length, mtu: UDP_MTU });
+        return false;
+      }
+      this.socket.send(packet, port, ip);
+      session.lastSeen = Date.now();
+      debug('UDPTransport', 'Sent encrypted data', { ip, port, size: packet.length });
+      return true;
+    } catch (e) {
+      error('UDPTransport', 'Encryption/send error', { error: e.message, ip, port });
+      return false;
+    }
+  }
 
-    _startHandshake(ip, port) {
-        const key = `${ip}:${port}`;
-        if (this.sessions.has(key) && this.sessions.get(key).established) {
-            debug('UDPTransport', 'Session already established, skipping handshake', { ip, port });
-            return;
-        }
+  _startHandshake(ip, port) {
+    const key = `${ip}:${port}`;
+    if (this.sessions.has(key) && this.sessions.get(key).established) return;
+    if (this.pendingHandshakes.has(key)) return;
+    info('UDPTransport', 'Starting handshake', { ip, port });
+    const timeout = setTimeout(() => {
+      this.pendingHandshakes.delete(key);
+      // 用户可见的超时提示（使用 chalk）
+      console.log(chalk.red(`连接 ${ip}:${port} 超时`));
+    }, HANDSHAKE_TIMEOUT);
+    this.pendingHandshakes.set(key, timeout);
+    const handshakeMsg = Buffer.concat([Buffer.from([0x01]), this.localX25519.publicKey]);
+    this.socket.send(handshakeMsg, port, ip);
+    debug('UDPTransport', 'Sent handshake packet', { ip, port });
+  }
+
+  _onMessage(buf, rinfo) {
+    const key = `${rinfo.address}:${rinfo.port}`;
+    debug('UDPTransport', 'Received packet', { from: key, size: buf.length });
+
+    // 握手包
+    if (buf.length === 33 && buf[0] === 0x01) {
+      const peerPublicKey = buf.slice(1);
+      const existing = this.sessions.get(key);
+      if (existing && existing.established) return;
+
+      try {
+        const shared = deriveSharedSecret(this.localX25519.secretKey, peerPublicKey);
+        const session = {
+          pubkey: null,
+          x25519Public: peerPublicKey,
+          sharedKey: shared,
+          outNonce: 0,
+          inNonce: 0,
+          lastSeen: Date.now(),
+          established: true
+        };
+        this.sessions.set(key, session);
         if (this.pendingHandshakes.has(key)) {
-            debug('UDPTransport', 'Handshake already pending', { ip, port });
-            return;
+          clearTimeout(this.pendingHandshakes.get(key));
+          this.pendingHandshakes.delete(key);
         }
-        info('UDPTransport', 'Starting handshake', { ip, port });
-        const timeout = setTimeout(() => {
-            this.pendingHandshakes.delete(key);
-            warn('UDPTransport', 'Handshake timeout', { ip, port });
-        }, HANDSHAKE_TIMEOUT);
-        this.pendingHandshakes.set(key, timeout);
-        const handshakeMsg = Buffer.concat([
-            Buffer.from([0x01]),
-            this.localX25519.publicKey
-        ]);
-        this.socket.send(handshakeMsg, port, ip);
-        debug('UDPTransport', 'Sent handshake packet', { ip, port });
+        const reply = Buffer.concat([Buffer.from([0x01]), this.localX25519.publicKey]);
+        this.socket.send(reply, rinfo.port, rinfo.address);
+        info('UDPTransport', 'Handshake complete (incoming)', { ip: rinfo.address, port: rinfo.port });
+        this.emit('handshake-complete', { ip: rinfo.address, port: rinfo.port, session });
+      } catch (e) {
+        error('UDPTransport', 'Handshake processing error', { error: e.message, from: key });
+      }
+      return;
     }
 
-    _onMessage(buf, rinfo) {
-        const key = `${rinfo.address}:${rinfo.port}`;
-        debug('UDPTransport', 'Received packet', { from: key, size: buf.length });
-
-        // 握手包
-        if (buf.length === 33 && buf[0] === 0x01) {
-            const peerPublicKey = buf.slice(1);
-            const existing = this.sessions.get(key);
-            if (existing && existing.established) {
-                debug('UDPTransport', 'Already established, ignoring handshake', { key });
-                return;
-            }
-
-            try {
-                const shared = deriveSharedSecret(this.localX25519.secretKey, peerPublicKey);
-                const session = {
-                    pubkey: null,
-                    x25519Public: peerPublicKey,
-                    sharedKey: shared,
-                    outNonce: 0,
-                    inNonce: 0,
-                    lastSeen: Date.now(),
-                    established: true
-                };
-                this.sessions.set(key, session);
-                if (this.pendingHandshakes.has(key)) {
-                    clearTimeout(this.pendingHandshakes.get(key));
-                    this.pendingHandshakes.delete(key);
-                }
-                const reply = Buffer.concat([Buffer.from([0x01]), this.localX25519.publicKey]);
-                this.socket.send(reply, rinfo.port, rinfo.address);
-                info('UDPTransport', 'Handshake complete (incoming)', { ip: rinfo.address, port: rinfo.port });
-                this.emit('handshake-complete', { ip: rinfo.address, port: rinfo.port, session });
-            } catch (e) {
-                error('UDPTransport', 'Handshake processing error', { error: e.message, from: key });
-            }
-            return;
-        }
-
-        // 数据包
-        const session = this.sessions.get(key);
-        if (!session || !session.established) {
-            debug('UDPTransport', 'No session, starting handshake', { key });
-            this._startHandshake(rinfo.address, rinfo.port);
-            return;
-        }
-
-        try {
-            if (buf.length < 28) {
-                warn('UDPTransport', 'Packet too short', { key, len: buf.length });
-                return;
-            }
-            const nonce = buf.slice(0, 12);
-            const ciphertext = buf.slice(12, buf.length - 16);
-            const authTag = buf.slice(buf.length - 16);
-            const decipher = createDecipheriv('aes-256-gcm', session.sharedKey, nonce);
-            decipher.setAuthTag(authTag);
-            const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-
-            const nonceNum = nonce.readUInt32BE(0);
-            if (nonceNum < session.inNonce) {
-                debug('UDPTransport', 'Replayed packet ignored', { key, nonce: nonceNum, expected: session.inNonce });
-                return;
-            }
-            session.inNonce = nonceNum + 1;
-            session.lastSeen = Date.now();
-
-            let msg;
-            try { msg = JSON.parse(plaintext.toString()); } catch (e) {
-                warn('UDPTransport', 'Invalid JSON in plaintext', { from: key, text: plaintext.toString() });
-                return;
-            }
-            if (msg.pubkey) {
-                session.pubkey = msg.pubkey;
-                this.peerAddresses.set(msg.pubkey, { ip: rinfo.address, port: rinfo.port });
-                debug('UDPTransport', 'Set peer pubkey', { pubkey: msg.pubkey.slice(0,8), from: key });
-            }
-            debug('UDPTransport', 'Received app message', { from: key, type: msg.type });
-            this.emit('message', { ip: rinfo.address, port: rinfo.port, msg, session });
-        } catch (e) {
-            error('UDPTransport', 'Decryption/processing error', { error: e.message, from: key });
-        }
+    // 数据包
+    const session = this.sessions.get(key);
+    if (!session || !session.established) {
+      debug('UDPTransport', 'No session, starting handshake', { key });
+      this._startHandshake(rinfo.address, rinfo.port);
+      return;
     }
 
-    sendJSON(peerId, json) {
-        const data = JSON.stringify(json);
-        if (Buffer.byteLength(data) > UDP_MTU - 32) {
-            warn('UDPTransport', 'JSON message too large', { size: Buffer.byteLength(data) });
-            return false;
-        }
-        let address;
-        if (peerId.includes(':')) {
-            const [ip, port] = peerId.split(':');
-            address = { ip, port: parseInt(port) };
-        } else {
-            const addr = this.peerAddresses.get(peerId);
-            if (!addr) {
-                debug('UDPTransport', 'No address known for peer', { peerId });
-                return false;
-            }
-            address = addr;
-        }
-        return this.sendTo(address.ip, address.port, Buffer.from(data));
-    }
+    try {
+      if (buf.length < 28) {
+        warn('UDPTransport', 'Packet too short', { key, len: buf.length });
+        return;
+      }
+      const nonce = buf.slice(0, 12);
+      const ciphertext = buf.slice(12, buf.length - 16);
+      const authTag = buf.slice(buf.length - 16);
+      const decipher = createDecipheriv('aes-256-gcm', session.sharedKey, nonce);
+      decipher.setAuthTag(authTag);
+      const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 
-    broadcast(json, excludePubkey = null) {
-        for (const [key, session] of this.sessions) {
-            if (!session.established) continue;
-            if (session.pubkey === excludePubkey) continue;
-            const [ip, port] = key.split(':');
-            this.sendTo(ip, parseInt(port), Buffer.from(JSON.stringify(json)));
+      const nonceNum = nonce.readUInt32BE(0);
+      if (nonceNum < session.inNonce) {
+        debug('UDPTransport', 'Replayed packet ignored', { key, nonce: nonceNum, expected: session.inNonce });
+        return;
+      }
+      session.inNonce = nonceNum + 1;
+      session.lastSeen = Date.now();
+
+      let msg;
+      try { msg = JSON.parse(plaintext.toString()); } catch (e) {
+        warn('UDPTransport', 'Invalid JSON in plaintext', { from: key, text: plaintext.toString() });
+        return;
+      }
+      if (msg.pubkey) {
+        session.pubkey = msg.pubkey;
+        this.peerAddresses.set(msg.pubkey, { ip: rinfo.address, port: rinfo.port });
+        debug('UDPTransport', 'Set peer pubkey', { pubkey: msg.pubkey.slice(0,8), from: key });
+        if (msg.nickname || msg.color) {
+          this.emit('profile-update', { pubkey: msg.pubkey, nickname: msg.nickname, color: msg.color });
         }
+      }
+      debug('UDPTransport', 'Received app message', { from: key, type: msg.type });
+      this.emit('message', { ip: rinfo.address, port: rinfo.port, msg, session });
+    } catch (e) {
+      error('UDPTransport', 'Decryption/processing error', { error: e.message, from: key });
     }
+  }
+
+  sendJSON(peerId, json) {
+    const data = JSON.stringify(json);
+    if (Buffer.byteLength(data) > UDP_MTU - 32) {
+      warn('UDPTransport', 'JSON message too large', { size: Buffer.byteLength(data) });
+      return false;
+    }
+    let address;
+    if (peerId.includes(':')) {
+      const [ip, port] = peerId.split(':');
+      address = { ip, port: parseInt(port) };
+    } else {
+      const addr = this.peerAddresses.get(peerId);
+      if (!addr) {
+        debug('UDPTransport', 'No address known for peer', { peerId });
+        return false;
+      }
+      address = addr;
+    }
+    return this.sendTo(address.ip, address.port, Buffer.from(data));
+  }
+
+  broadcast(json, excludePubkey = null) {
+    for (const [key, session] of this.sessions) {
+      if (!session.established) continue;
+      if (session.pubkey === excludePubkey) continue;
+      const [ip, port] = key.split(':');
+      this.sendTo(ip, parseInt(port), Buffer.from(JSON.stringify(json)));
+    }
+  }
 }
