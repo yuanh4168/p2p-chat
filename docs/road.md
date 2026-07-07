@@ -4,11 +4,12 @@
 
 ## 执行排版
 
-- 1.bug-1
-- 2.bug-2
-- 3.bug-3
-- 4.bug-5
-- 6.new-1 
+- chore-1
+- bug-1
+- bug-2
+- bug-3
+- bug-5
+- new-1 
 
 ### bugs
 
