@@ -9,6 +9,8 @@ import { aesDecrypt, aesEncrypt, toHex, sign, fromHex } from './crypto.js';
 import { verifyMessage, computeMessageId, storeValidMessage, decryptMessageBody } from './message.js';
 import { appendSystemMessage, appendMessage, updateStatus, formatMessage } from './ui.js';
 import { shortPub, getGroupName, getTopicName, getTimeStr } from './utils.js';
+import { strings } from './strings.js';
+import { formatString } from './format.js';
 
 export function broadcastMyProfile() {
   const profileMsg = {
@@ -36,12 +38,12 @@ export function broadcastStatus() {
 
 export function sendMessage(text) {
   if (!state.currentGroupId) {
-    appendSystemMessage('错误：未选择群组，请先 /use');
+    appendSystemMessage(strings.ERROR_NO_GROUP);
     return;
   }
   const symKey = state.groupKeys.get(state.currentGroupId);
   if (!symKey) {
-    appendSystemMessage('错误：无群组密钥');
+    appendSystemMessage(strings.ERROR_NO_GROUP_KEY);
     return;
   }
   const bodyEncrypted = aesEncrypt(Buffer.from(text), symKey);
@@ -129,6 +131,16 @@ export function handleAppMessage(msg, session) {
         }
         break;
       }
+      case 'FILE_ACK': {
+        const { msgId } = msg;
+        const pending = state.pendingFileAcks.get(msgId);
+        if (pending) {
+          clearTimeout(pending.timeout);
+          pending.resolve();
+          state.pendingFileAcks.delete(msgId);
+        }
+        break;
+      }
       case 'NEW_MSG': {
         const { message } = msg;
         try {
@@ -142,28 +154,66 @@ export function handleAppMessage(msg, session) {
               throw e;
             }
           }
-          if (state.currentGroupId === message.group_id && state.currentTopicId === message.topic_id) {
-            const symKey = state.groupKeys.get(message.group_id);
-            if (symKey) {
+          const symKey = state.groupKeys.get(message.group_id);
+          if (symKey) {
+            try {
               const plain = decryptMessageBody(message, symKey);
-              const displayName = getDisplayNameWithSelf(message.author, state.myPubkey, state.myNickname);
-              const time = getTimeStr();
-              const msgText = formatMessage(displayName, plain, time);
-              appendMessage(msgText, message.author === state.myPubkey);
+              if (message.type === 'file') {
+                const fileInfo = JSON.parse(plain);
+                state.pendingFiles.set(message.id, {
+                  filename: fileInfo.filename,
+                  filesize: fileInfo.filesize,
+                  filedata: fileInfo.filedata,
+                  from: message.author,
+                  groupId: message.group_id,
+                  topicId: message.topic_id,
+                  timestamp: message.timestamp
+                });
+                if (message.author !== state.myPubkey) {
+                  state.transport.sendJSON(message.author, { type: 'FILE_ACK', msgId: message.id });
+                }
+                const displayName = getDisplayNameWithSelf(message.author, state.myPubkey, state.myNickname);
+                const groupName = getGroupName(message.group_id);
+                const topicName = getTopicName(message.topic_id);
+                appendSystemMessage(formatString(strings.FILE_RECEIVED, {
+                  filename: fileInfo.filename,
+                  size: fileInfo.filesize,
+                  from: displayName,
+                  group: groupName,
+                  topic: topicName
+                }));
+                appendSystemMessage(formatString(strings.FILE_DOWNLOAD_HINT, { id: message.id }));
+                if (state.currentGroupId === message.group_id && state.currentTopicId === message.topic_id) {
+                  const time = getTimeStr();
+                  const msgText = `{${time}} (${displayName}) 发送了文件：${fileInfo.filename} (${fileInfo.filesize} 字节)`;
+                  appendMessage(msgText, message.author === state.myPubkey);
+                }
+              } else {
+                if (state.currentGroupId === message.group_id && state.currentTopicId === message.topic_id) {
+                  const displayName = getDisplayNameWithSelf(message.author, state.myPubkey, state.myNickname);
+                  const time = getTimeStr();
+                  const msgText = formatMessage(displayName, plain, time);
+                  appendMessage(msgText, message.author === state.myPubkey);
+                }
+              }
+            } catch(e) {
+              appendSystemMessage(formatString(strings.ERROR_MSG_DECRYPT, { msg: e.message }));
             }
+          } else {
+            appendSystemMessage(formatString(strings.ERROR_MSG_ENCRYPTED_NO_KEY, { groupId: message.group_id }));
           }
           const exclude = session.pubkey || message.author;
           state.transport.broadcast({ type: 'NEW_MSG', message }, exclude);
         } catch(e) {
-          appendSystemMessage(`消息处理失败: ${e.message}`);
+          appendSystemMessage(formatString(strings.MSG_PROCESS_FAIL, { msg: e.message }));
         }
         break;
       }
       case 'JOIN_REQUEST': {
         const { groupId, requester } = msg;
         if (isAdmin(groupId, state.myPubkey)) {
-          appendSystemMessage(`[加入请求] ${shortPub(requester)} 想加入群组 ${groupId}`);
-          appendSystemMessage('使用 /approve <申请人公钥> <群组ID> 批准');
+          appendSystemMessage(formatString(strings.JOIN_REQUEST_RECEIVED, { pubkey: shortPub(requester), id: groupId }));
+          appendSystemMessage(strings.JOIN_APPROVE_HINT);
           addJoinRequest(groupId, requester);
         }
         break;
@@ -178,11 +228,11 @@ export function handleAppMessage(msg, session) {
           saveGroup(groupId, groupName || '未知群组', creator || '未知', encrypted);
           state.groupKeys.set(groupId, symKey);
           addMember(groupId, state.myPubkey, 'member');
-          appendSystemMessage(`已批准加入群组 ${groupId}`);
+          appendSystemMessage(formatString(strings.JOIN_APPROVAL_RECEIVED, { id: groupId }));
           const g = getGroup(groupId);
           updateStatus(g ? g.name : '未知', state.currentTopicId ? getTopicName(state.currentTopicId) : '无');
         } catch(e) {
-          appendSystemMessage('解密群组密钥失败');
+          appendSystemMessage(strings.DECRYPT_FAIL);
         }
         break;
       }
@@ -193,12 +243,11 @@ export function handleAppMessage(msg, session) {
         }
         break;
       }
-      // ---------- 新增群组管理消息 ----------
       case 'GROUP_RENAME': {
         const { groupId, newName } = msg;
         if (groupId && newName) {
           updateGroupName(groupId, newName);
-          appendSystemMessage(`群组 ${groupId} 已更名为：${newName}`);
+          appendSystemMessage(formatString(strings.GROUP_RENAMED, { name: newName }));
           if (state.currentGroupId === groupId) {
             const g = getGroup(groupId);
             updateStatus(g ? g.name : '未知', state.currentTopicId ? getTopicName(state.currentTopicId) : '无');
@@ -209,7 +258,6 @@ export function handleAppMessage(msg, session) {
       case 'GROUP_DELETE': {
         const { groupId } = msg;
         if (groupId) {
-          // 删除本地群组
           deleteGroup(groupId);
           state.groupKeys.delete(groupId);
           if (state.currentGroupId === groupId) {
@@ -217,18 +265,23 @@ export function handleAppMessage(msg, session) {
             state.currentTopicId = null;
             updateStatus('无', '无');
           }
-          appendSystemMessage(`群组 ${groupId} 已被管理员解散`);
+          appendSystemMessage(formatString(strings.GROUP_DELETED, { id: groupId }));
         }
         break;
       }
       case 'GROUP_LEAVE': {
         const { groupId, leaver } = msg;
         if (groupId && leaver) {
-          // 仅当本地存在该群且该成员在成员列表中
           if (getGroup(groupId)) {
             removeMember(groupId, leaver);
-            appendSystemMessage(`${shortPub(leaver)} 已退出群组 ${groupId}`);
-            // 如果离开者是自己，但自己不会发送给自己，所以忽略
+            if (leaver === state.myPubkey) {
+              if (state.currentGroupId === groupId) {
+                state.currentGroupId = null;
+                state.currentTopicId = null;
+                updateStatus('无', '无');
+              }
+            }
+            appendSystemMessage(formatString(strings.GROUP_LEAVE_NOTIFICATION, { pubkey: shortPub(leaver), id: groupId }));
           }
         }
         break;

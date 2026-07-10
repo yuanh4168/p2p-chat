@@ -9,5 +9,7 @@ export const state = {
   currentTopicId: null,
   groupKeys: new Map(),
   myNickname: '',
-  peerStatus: new Map() // pubkey -> { groupId, topicId }
+  peerStatus: new Map(),
+  pendingFiles: new Map(),          // 暂存待下载的文件
+  pendingFileAcks: new Map()        // msgId -> { timeout, resolve, reject }
 };

@@ -20,12 +20,13 @@ import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
 
-// 导入拆分后的模块
 import { state } from './state.js';
 import { initTerminal, restoreTerminal, updateStatus, appendSystemMessage, appendMessage, setupInput, onResize } from './ui.js';
 import { handleCommand } from './commands.js';
 import { broadcastMyProfile, broadcastStatus, sendMessage, handleAppMessage } from './app-handler.js';
 import { shortPub, getTailscaleIPs, getGroupName, getTopicName, getTimeStr } from './utils.js';
+import { strings } from './strings.js';
+import { formatString } from './format.js';
 
 setupGlobalErrorHandler();
 
@@ -82,8 +83,8 @@ async function main() {
 
   // 身份处理
   if (!user) {
-    appendSystemMessage('首次运行：创建身份');
-    const password = await question('设置密码：');
+    appendSystemMessage(strings.FIRST_RUN_CREATE);
+    const password = await question(strings.SET_PASSWORD);
     info('MAIN', 'Creating new identity');
     const keyPair = generateKeyPair();
     const x25519KeyPair = ed25519SecretToX25519(keyPair.secretKey);
@@ -97,16 +98,16 @@ async function main() {
     state.masterKey = masterKey;
     state.myPubkey = myPubkey;
     state.myNickname = myNickname;
-    appendSystemMessage(`身份已创建，你的公钥：${myPubkey}`);
+    appendSystemMessage(formatString(strings.IDENTITY_CREATED, { pubkey: myPubkey }));
     info('MAIN', 'New identity created', { pubkey: myPubkey });
   } else {
-    appendSystemMessage(`欢迎回来，用户 ${shortPub(user.pubkey)}...`);
-    const password = await question('输入密码：');
+    appendSystemMessage(formatString(strings.WELCOME_BACK, { shortPub: shortPub(user.pubkey) }));
+    const password = await question(strings.ENTER_PASSWORD);
     let encryptedObj;
     try {
       encryptedObj = JSON.parse(user.encrypted_private_key);
     } catch (e) {
-      appendSystemMessage('存储的私钥已损坏，请重置 data/chat.db 并重新启动。');
+      appendSystemMessage(strings.PRIVATE_KEY_CORRUPTED);
       error('MAIN', 'Encrypted private key corrupted', { error: e.message });
       process.exit(1);
     }
@@ -122,10 +123,10 @@ async function main() {
       state.masterKey = masterKey;
       state.myPubkey = myPubkey;
       state.myNickname = myNickname;
-      appendSystemMessage(`登录成功，你的公钥：${myPubkey}`);
+      appendSystemMessage(formatString(strings.LOGIN_SUCCESS, { pubkey: myPubkey }));
       info('MAIN', 'User logged in', { pubkey: myPubkey });
     } catch (e) {
-      appendSystemMessage('❌ 密码错误或数据损坏，请确认密码或删除 data/chat.db 重新创建。');
+      appendSystemMessage(strings.PASSWORD_WRONG);
       process.exit(1);
     }
   }
@@ -134,7 +135,7 @@ async function main() {
   setupInput((line) => {
     if (line.startsWith('/')) {
       handleCommand(line).catch(e => {
-        appendSystemMessage(`命令执行错误：${e.message}`);
+        appendSystemMessage(formatString(strings.ERROR_PREFIX, { msg: e.message }));
       });
     } else {
       sendMessage(line);
@@ -149,10 +150,10 @@ async function main() {
     await dht.waitReady();
     state.dht = dht;
     info('MAIN', 'DHT ready', { port: dht.port });
-    appendSystemMessage(`DHT 正在 UDP 端口 ${dht.port} 监听`);
+    appendSystemMessage(formatString(strings.DHT_LISTENING, { port: dht.port }));
   } catch (err) {
     error('MAIN', 'DHT initialization failed', err);
-    appendSystemMessage('DHT 初始化失败，请检查网络或端口');
+    appendSystemMessage(strings.DHT_INIT_FAIL);
   }
 
   // UDP Transport
@@ -160,7 +161,7 @@ async function main() {
   state.transport = transport;
   transport.on('error', (err) => {
     error('MAIN', 'UDP transport runtime error', err);
-    appendSystemMessage(`UDP 运行时错误，但程序将继续运行: ${err.message}`);
+    appendSystemMessage(formatString(strings.ERROR_PREFIX, { msg: err.message }));
   });
   transport.on('profile-update', ({ pubkey, nickname }) => {
     if (pubkey && nickname) {
@@ -169,18 +170,25 @@ async function main() {
     }
   });
 
-  // 监听握手超时事件（Bug-1）
+  // 监听握手超时事件
   transport.on('handshake-timeout', ({ ip, port }) => {
-    appendSystemMessage(`连接 ${ip}:${port} 超时`);
+    appendSystemMessage(formatString(strings.CONNECTION_TIMEOUT, { ip, port }));
   });
 
-  // 监听会话移除事件（Bug-8）
+  // 监听握手完成，显示延迟
+  transport.on('handshake-complete', ({ ip, port, session, delay }) => {
+    if (delay !== undefined) {
+      appendSystemMessage(formatString(strings.HANDSHAKE_SUCCESS, { ip, port, delay }));
+    }
+    // 其他处理（身份等）在 main 原有逻辑中已经包含，此处只做延迟显示
+  });
+
+  // 监听会话移除事件
   transport.on('session-removed', ({ pubkey, ip, port }) => {
     if (pubkey) {
       state.peerStatus.delete(pubkey);
       debug('MAIN', 'Removed peer from status', { pubkey: shortPub(pubkey) });
     }
-    // 更新状态栏
     const g = state.currentGroupId ? getGroup(state.currentGroupId) : null;
     const t = state.currentTopicId ? getTopic(state.currentTopicId) : null;
     updateStatus(g ? g.name : '无', t ? t.name : '无');
@@ -189,10 +197,10 @@ async function main() {
   try {
     await transport.listen();
     info('MAIN', 'UDP transport ready', { port: transport.port });
-    appendSystemMessage(`UDP 传输正在监听端口 ${transport.port}`);
+    appendSystemMessage(formatString(strings.UDP_LISTENING, { port: transport.port }));
   } catch (err) {
     error('MAIN', 'UDP transport initialization failed', err);
-    appendSystemMessage('UDP 传输初始化失败，请检查端口是否被占用');
+    appendSystemMessage(strings.UDP_INIT_FAIL);
     process.exit(1);
   }
 
@@ -200,17 +208,17 @@ async function main() {
   try {
     const tailscaleIPs = await getTailscaleIPs();
     if (tailscaleIPs.length > 0) {
-      appendSystemMessage(`Tailscale IP: ${tailscaleIPs.join(', ')} （可用于 /connect 连接）`);
+      appendSystemMessage(formatString(strings.TAILSCALE_IP, { ips: tailscaleIPs.join(', ') }));
       info('MAIN', 'Tailscale IPs found', { ips: tailscaleIPs });
     } else {
-      appendSystemMessage('未检测到 Tailscale 网络，您仍可使用公网 IP 或手动连接。');
+      appendSystemMessage(strings.TAILSCALE_NOT_FOUND);
     }
   } catch (e) {
     if (e.message === 'NOT_INSTALLED') {
-      appendSystemMessage('❌ 未检测到 Tailscale。请访问 https://tailscale.com/download 下载并安装 Tailscale，然后登录您的账号（tailscale login），即可获得安全的内网 IP 用于连接。');
+      appendSystemMessage(strings.TAILSCALE_NOT_INSTALLED);
       info('MAIN', 'Tailscale not installed');
     } else {
-      appendSystemMessage(`检测 Tailscale 出错: ${e.message}`);
+      appendSystemMessage(formatString(strings.TAILSCALE_ERROR, { msg: e.message }));
       error('MAIN', 'Tailscale detection error', { error: e.message });
     }
   }
@@ -226,7 +234,7 @@ async function main() {
       }
     }
     if (conns.length > 0) {
-      appendSystemMessage(`已尝试连接 ${conns.length} 个已知节点...`);
+      appendSystemMessage(formatString(strings.KNOWN_NODES_CONNECT, { count: conns.length }));
     }
   } catch (err) {
     error('MAIN', 'Error loading connections', err);
@@ -246,14 +254,12 @@ async function main() {
   // ---- 事件绑定 ----
   transport.on('handshake-complete', ({ ip, port, session }) => {
     info('MAIN', 'Handshake complete', { ip, port });
-    appendSystemMessage(`[连接] 与 ${ip}:${port} 握手成功`);
+    // 原有握手成功逻辑（不重复显示延迟，延迟由上面的监听显示）
     const g = state.currentGroupId ? getGroup(state.currentGroupId) : null;
     const t = state.currentTopicId ? getTopic(state.currentTopicId) : null;
     updateStatus(g ? g.name : '无', t ? t.name : '无');
-    // 仅发送 IDENTITY，其他消息延迟发送，避免对方处理顺序问题
     const identity = { type: 'IDENTITY', pubkey: state.myPubkey, nickname: state.myNickname };
     transport.sendTo(ip, port, Buffer.from(JSON.stringify(identity)));
-    // 延迟发送 STATUS 和 GROUP_LIST
     setTimeout(() => {
       if (state.currentGroupId && state.currentTopicId) {
         const statusMsg = { type: 'STATUS', pubkey: state.myPubkey, groupId: state.currentGroupId, topicId: state.currentTopicId };
@@ -294,7 +300,6 @@ async function main() {
           await dht.announce(infoHash);
           const peers = await dht.lookup(infoHash);
           for (const p of peers) {
-            // 过滤无效 IP
             if (p.host === '0.0.0.0' || p.host === '::' || !p.host) continue;
             const key = `${p.host}:${p.port}`;
             if (!transport.sessions.has(key)) {
@@ -334,9 +339,9 @@ async function main() {
   }, 3000);
 
   // 显示欢迎信息
-  appendSystemMessage('===== P2P 聊天系统 (UDP) =====');
-  appendSystemMessage('输入 /help 查看命令帮助');
-  appendSystemMessage('直接输入文本即可发送到当前群组/话题\n');
+  appendSystemMessage(strings.WELCOME);
+  appendSystemMessage(strings.HELP_PROMPT);
+  appendSystemMessage(strings.DIRECT_INPUT + '\n');
 
   // 窗口大小变化处理
   process.stdout.on('resize', () => {

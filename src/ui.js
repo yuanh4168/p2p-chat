@@ -14,13 +14,14 @@ let termRows = 0, termCols = 0;
 let inputBuffer = '';
 let inputCursor = 0;
 
-// 消息历史：{ type: 'system'|'command'|'message', text, isSelf? }
+// 消息历史
 const messages = [];
 
 // ---------- 显示宽度计算 ----------
 function getDisplayWidth(str) {
+  const plain = str.replace(/\x1b\[[0-9;]*m/g, '');
   let w = 0;
-  for (const ch of str) {
+  for (const ch of plain) {
     const code = ch.charCodeAt(0);
     if ((code >= 0x4E00 && code <= 0x9FFF) ||
         (code >= 0x3000 && code <= 0x303F) ||
@@ -37,13 +38,28 @@ function getDisplayWidth(str) {
 // ---------- 按显示宽度换行 ----------
 function wrapTextByWidth(text, maxWidth) {
   if (maxWidth < 1) return [];
+  const plain = text.replace(/\x1b\[[0-9;]*m/g, '');
   const lines = [];
   let currentLine = '';
   let currentWidth = 0;
-  for (const ch of text) {
-    const chWidth = getDisplayWidth(ch);
-    if (currentWidth + chWidth > maxWidth) {
-      if (currentLine) lines.push(currentLine);
+  let plainIndex = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '\x1b') {
+      let end = i + 1;
+      while (end < text.length && text[end] !== 'm') end++;
+      if (end < text.length) {
+        const seq = text.slice(i, end + 1);
+        currentLine += seq;
+        i = end;
+        continue;
+      }
+    }
+    const chPlain = plain[plainIndex] || '';
+    const chWidth = getDisplayWidth(chPlain);
+    plainIndex++;
+    if (currentWidth + chWidth > maxWidth && currentLine.length > 0) {
+      lines.push(currentLine);
       currentLine = ch;
       currentWidth = chWidth;
     } else {
@@ -99,13 +115,25 @@ function fullRedraw() {
 
   const allLines = [];
   for (const entry of messages) {
-    let colorFn;
-    if (entry.type === 'system') colorFn = chalk.gray;
-    else if (entry.type === 'command') colorFn = chalk.yellow;
-    else if (entry.type === 'message') colorFn = entry.isSelf ? chalk.green : chalk.blue;
-    const wrapped = wrapTextByWidth(entry.text, maxWidth);
-    for (const line of wrapped) {
-      allLines.push(colorFn ? colorFn(line) : line);
+    let lines;
+    if (entry.type === 'raw') {
+      lines = entry.text.split('\n');
+    } else {
+      lines = wrapTextByWidth(entry.text, maxWidth);
+    }
+    for (const line of lines) {
+      const hasAnsi = line.includes('\x1b');
+      let output = line;
+      if (!hasAnsi) {
+        if (entry.type === 'message') {
+          output = entry.isSelf ? chalk.green(line) : chalk.blue(line);
+        } else if (entry.type === 'system') {
+          output = chalk.gray(line);
+        } else if (entry.type === 'command') {
+          output = chalk.yellow(line);
+        }
+      }
+      allLines.push(output);
     }
   }
 
@@ -141,16 +169,13 @@ export function appendMessage(text, isSelf = false) {
   fullRedraw();
 }
 
-// 系统消息自动添加时间戳
 export function appendSystemMessage(text) {
   const timeStr = getTimeStr();
   messages.push({ type: 'system', text: `[${timeStr}] ${text}` });
   fullRedraw();
 }
 
-// 命令日志也添加时间戳（已在 commands.js 中加过，此处保留也可）
 export function appendCommandMessage(text) {
-  // 如果外部已加时间戳则直接使用，否则添加
   if (!text.startsWith('[')) {
     const timeStr = getTimeStr();
     text = `[${timeStr}] ${text}`;
@@ -159,7 +184,11 @@ export function appendCommandMessage(text) {
   fullRedraw();
 }
 
-// 格式化消息（纯文本，不含颜色）
+export function appendRaw(text) {
+  messages.push({ type: 'raw', text });
+  fullRedraw();
+}
+
 export function formatMessage(displayName, text, time) {
   return `{${time}} (${displayName}) ${text}`;
 }
@@ -190,10 +219,18 @@ export function setupInput(onLineCallback) {
         inputCursor--;
         drawInputLine();
       }
+    } else if (key.startsWith('\x1b[')) {
+      // 方向键：左右移动光标
+      const code = key.slice(2);
+      if (code === 'D' && inputCursor > 0) {
+        inputCursor--;
+        drawInputLine();
+      } else if (code === 'C' && inputCursor < inputBuffer.length) {
+        inputCursor++;
+        drawInputLine();
+      }
     } else if (key === '\x1b') {
       // ignore
-    } else if (key.startsWith('\x1b[')) {
-      // ignore arrow keys
     } else {
       const before = inputBuffer.slice(0, inputCursor);
       const after = inputBuffer.slice(inputCursor);

@@ -8,11 +8,16 @@ import {
   updateGroupName, getProfile, saveProfileRemote, getGroupKey
 } from './db.js';
 import { createGroup, requestJoin } from './group.js';
-import { toHex, sha256, fromHex, aesEncrypt } from './crypto.js';
-import { decryptMessageBody } from './message.js';
-import { appendSystemMessage, appendMessage, updateStatus, formatMessage, appendCommandMessage } from './ui.js';
+import { toHex, sha256, fromHex, aesEncrypt, sign } from './crypto.js';
+import { verifyMessage, computeMessageId, storeValidMessage, decryptMessageBody } from './message.js';
+import { appendSystemMessage, appendMessage, updateStatus, formatMessage, appendCommandMessage, appendRaw } from './ui.js';
 import { shortPub, getGroupName, getTopicName, getTimeStr, getTailscaleIPs } from './utils.js';
 import { broadcastStatus } from './app-handler.js';
+import { UDP_MTU } from './config.js';
+import fs from 'fs';
+import path from 'path';
+import { strings } from './strings.js';
+import { formatString } from './format.js';
 
 // ---------- 辅助函数：根据公钥前缀解析唯一公钥 ----------
 function resolvePubkey(prefix, groupId = null) {
@@ -33,7 +38,7 @@ function resolvePubkey(prefix, groupId = null) {
 
   const arr = Array.from(candidates);
   if (arr.length === 1) return arr[0];
-  if (arr.length > 1) throw new Error(`公钥前缀 "${prefix}" 不唯一，请提供更多位`);
+  if (arr.length > 1) throw new Error(formatString(strings.ERR_REQUESTER_NOT_FOUND, { input: prefix }));
   return null;
 }
 
@@ -49,7 +54,7 @@ export function handleOnline(subcmd) {
     if (!peers.includes(state.myPubkey)) peers.push(state.myPubkey);
     peers = [...new Set(peers)];
   } else if (subcmd === 'group') {
-    if (!state.currentGroupId) { appendSystemMessage('未选择群组'); return; }
+    if (!state.currentGroupId) { appendSystemMessage(strings.ERR_NEED_TOPIC); return; }
     const groupId = state.currentGroupId;
     const statusPeers = [];
     for (const [pubkey, status] of state.peerStatus) {
@@ -66,7 +71,7 @@ export function handleOnline(subcmd) {
     peers = [...new Set([...statusPeers, ...sessionPeers])];
     if (isMember(groupId, state.myPubkey)) peers.push(state.myPubkey);
   } else {
-    if (!state.currentGroupId || !state.currentTopicId) { appendSystemMessage('未选择群组或话题'); return; }
+    if (!state.currentGroupId || !state.currentTopicId) { appendSystemMessage(strings.ERR_NEED_TOPIC); return; }
     for (const [pubkey, status] of state.peerStatus) {
       if (status.groupId === state.currentGroupId && status.topicId === state.currentTopicId && pubkey !== state.myPubkey) {
         if (isMember(state.currentGroupId, pubkey)) {
@@ -78,16 +83,16 @@ export function handleOnline(subcmd) {
   }
 
   if (peers.length === 0) {
-    appendSystemMessage('当前没有在线用户');
+    appendSystemMessage(strings.ONLINE_NO_USERS);
     return;
   }
 
   let title = '';
-  if (subcmd === 'all') title = '所有连接节点';
-  else if (subcmd === 'group') title = `群组 ${getGroupName(state.currentGroupId)} 在线用户`;
-  else title = `话题 ${getTopicName(state.currentTopicId)} 在线用户`;
+  if (subcmd === 'all') title = formatString(strings.ONLINE_TITLE_ALL, { count: peers.length });
+  else if (subcmd === 'group') title = formatString(strings.ONLINE_TITLE_GROUP, { group: getGroupName(state.currentGroupId), count: peers.length });
+  else title = formatString(strings.ONLINE_TITLE_TOPIC, { topic: getTopicName(state.currentTopicId), count: peers.length });
 
-  appendSystemMessage(`--- ${title} (${peers.length}) ---`);
+  appendSystemMessage(`--- ${title} ---`);
   for (const pubkey of peers) {
     const display = getDisplayNameWithSelf(pubkey, state.myPubkey, state.myNickname);
     const hash = pubkey.slice(0, 16);
@@ -102,7 +107,6 @@ export function handleOnline(subcmd) {
 
 // ---------- 主命令处理 ----------
 export async function handleCommand(line) {
-  // 记录命令及时间
   const timeStr = getTimeStr();
   appendCommandMessage(`[${timeStr}] > ${line}`);
 
@@ -113,17 +117,17 @@ export async function handleCommand(line) {
     switch (cmd) {
       case '/create': {
         const name = parts.slice(1).join(' ');
-        if (!name) throw new Error('需要群组名称');
+        if (!name) throw new Error(strings.ERR_NEED_GROUP_NAME);
         const { id, symKey } = createGroup(name, state.myPubkey, state.masterKey);
         state.groupKeys.set(id, symKey);
         state.currentGroupId = id;
         const defaultTopic = getDefaultTopic(id);
         state.currentTopicId = defaultTopic.id;
-        appendSystemMessage(`群组已创建：${id}（默认话题：${defaultTopic.name}）`);
+        appendSystemMessage(formatString(strings.GROUP_CREATED, { id, topic: defaultTopic.name }));
         try {
           await state.dht.announce(fromHex(id));
         } catch (e) {
-          appendSystemMessage('DHT 公告失败（可能因网络原因，但手动连接不受影响）');
+          appendSystemMessage(strings.DHT_INIT_FAIL);
         }
         updateStatus(name, defaultTopic.name);
         broadcastStatus();
@@ -131,14 +135,13 @@ export async function handleCommand(line) {
       }
       case '/join': {
         const groupId = parts[1];
-        if (!groupId) throw new Error('需要群组 ID');
+        if (!groupId) throw new Error(strings.ERR_NEED_GROUP_ID);
         if (isMember(groupId, state.myPubkey)) {
-          appendSystemMessage('已是该群组成员');
+          appendSystemMessage(strings.ALREADY_MEMBER);
         } else {
-          // 先尝试通过 DHT 发现该群组的节点并连接
           const infoHash = fromHex(groupId);
           try {
-            appendSystemMessage(`正在通过 DHT 查找群组 ${groupId} 的节点...`);
+            appendSystemMessage(formatString(strings.SYNC_MSGS, { count: 0 })); // 占位
             const peers = await state.dht.lookup(infoHash);
             let connected = 0;
             for (const p of peers) {
@@ -148,49 +151,48 @@ export async function handleCommand(line) {
               }
             }
             if (connected > 0) {
-              appendSystemMessage(`已向 ${connected} 个节点发起连接，等待握手...`);
-              // 等待 2 秒让握手可能完成
+              appendSystemMessage(formatString(strings.SYNC_MSGS, { count: connected }));
               await new Promise(resolve => setTimeout(resolve, 2000));
             } else {
-              appendSystemMessage('DHT 未找到该群组的活跃节点，将广播请求（可能无法送达）');
+              appendSystemMessage(strings.DHT_NOT_FOUND);
             }
           } catch (e) {
-            appendSystemMessage('DHT 查找失败，将广播请求');
+            appendSystemMessage(strings.DHT_LOOKUP_FAIL);
           }
           requestJoin(groupId, state.myPubkey, state.transport);
-          appendSystemMessage(`已向群组 ${groupId} 发送加入请求`);
+          appendSystemMessage(formatString(strings.JOIN_REQUEST_SENT, { id: groupId }));
         }
         break;
       }
       case '/use': {
         const groupId = parts[1];
-        if (!groupId) throw new Error('需要群组 ID');
+        if (!groupId) throw new Error(strings.ERR_NEED_GROUP_ID);
         const g = getGroup(groupId);
-        if (!g) throw new Error('群组不存在');
+        if (!g) throw new Error(strings.GROUP_NOT_EXIST);
         if (!isMember(groupId, state.myPubkey) && groupId !== g.creator_pubkey) {
-          appendSystemMessage('您不是该群组的成员');
+          appendSystemMessage(strings.NOT_MEMBER);
         } else {
           state.currentGroupId = groupId;
           const defaultTopic = getDefaultTopic(groupId);
           state.currentTopicId = defaultTopic.id;
-          appendSystemMessage(`已切换到群组 ${g.name}（${groupId}），话题：${defaultTopic.name}`);
+          appendSystemMessage(formatString(strings.GROUP_SWITCHED, { name: g.name, id: groupId, topic: defaultTopic.name }));
           updateStatus(g.name, defaultTopic.name);
           broadcastStatus();
         }
         break;
       }
       case '/topic': {
-        if (!state.currentGroupId) throw new Error('未选择群组');
+        if (!state.currentGroupId) throw new Error(strings.ERR_NEED_TOPIC);
         const topicName = parts.slice(1).join(' ');
         if (!topicName) {
           const topics = getTopicsByGroup(state.currentGroupId);
-          appendSystemMessage('话题列表：' + topics.map(t=>`${t.name} (${t.id})`).join(', '));
+          appendSystemMessage(formatString(strings.TOPIC_LIST, { topics: topics.map(t=>`${t.name} (${t.id})`).join(', ') }));
           break;
         }
         if (topicName === 'general') {
           const defaultTopic = getDefaultTopic(state.currentGroupId);
           state.currentTopicId = defaultTopic.id;
-          appendSystemMessage(`已切换到默认话题：general`);
+          appendSystemMessage(strings.TOPIC_SWITCHED_DEFAULT);
           const g = getGroup(state.currentGroupId);
           updateStatus(g ? g.name : '未知', 'general');
           broadcastStatus();
@@ -200,10 +202,10 @@ export async function handleCommand(line) {
         const existing = getTopic(topicId);
         if (!existing) {
           saveTopic(topicId, state.currentGroupId, topicName);
-          appendSystemMessage(`话题已创建：${topicName} (ID: ${topicId})`);
+          appendSystemMessage(formatString(strings.TOPIC_CREATED, { name: topicName, id: topicId }));
         }
         state.currentTopicId = topicId;
-        appendSystemMessage(`已切换到话题：${topicName}`);
+        appendSystemMessage(formatString(strings.TOPIC_SWITCHED, { name: topicName }));
         const g = getGroup(state.currentGroupId);
         updateStatus(g ? g.name : '未知', topicName);
         broadcastStatus();
@@ -212,10 +214,10 @@ export async function handleCommand(line) {
       case '/approve': {
         const requesterInput = parts[1];
         const groupId = parts[2] || state.currentGroupId;
-        if (!requesterInput || !groupId) throw new Error('用法：/approve <申请人公钥/前缀> <群组ID>');
-        if (!isAdmin(groupId, state.myPubkey)) throw new Error('您不是该群组的管理员');
+        if (!requesterInput || !groupId) throw new Error(strings.ERR_APPROVE_USAGE);
+        if (!isAdmin(groupId, state.myPubkey)) throw new Error(strings.ERR_NOT_ADMIN);
         const requester = resolvePubkey(requesterInput, groupId);
-        if (!requester) throw new Error(`未找到匹配 "${requesterInput}" 的公钥`);
+        if (!requester) throw new Error(formatString(strings.ERR_REQUESTER_NOT_FOUND, { input: requesterInput }));
         let sharedKey = null;
         for (const [, sess] of state.transport.sessions) {
           if (sess.pubkey === requester) {
@@ -223,9 +225,9 @@ export async function handleCommand(line) {
             break;
           }
         }
-        if (!sharedKey) throw new Error('请求者未连接或没有共享密钥');
+        if (!sharedKey) throw new Error(strings.ERR_REQUESTER_NOT_CONNECTED);
         const symKey = state.groupKeys.get(groupId);
-        if (!symKey) throw new Error('未找到群组密钥');
+        if (!symKey) throw new Error(strings.ERR_GROUP_KEY_NOT_FOUND);
         const encryptedKey = aesEncrypt(symKey, sharedKey);
         const g = getGroup(groupId);
         const approval = {
@@ -238,13 +240,13 @@ export async function handleCommand(line) {
         state.transport.sendJSON(requester, approval);
         addMember(groupId, requester, 'member');
         updateRequestStatus(groupId, requester, 'approved');
-        appendSystemMessage(`已批准 ${shortPub(requester)} 加入群组 ${groupId}`);
+        appendSystemMessage(formatString(strings.JOIN_APPROVED, { pubkey: shortPub(requester), id: groupId }));
         break;
       }
       case '/list': {
-        const groups = getAllGroups();
+        const groups = getAllGroups().filter(g => isMember(g.id, state.myPubkey));
         if (groups.length === 0) {
-          appendSystemMessage('暂无群组');
+          appendSystemMessage(strings.NO_GROUPS);
         } else {
           groups.forEach(g => appendSystemMessage(`${g.id}  ${g.name}（创建者：${shortPub(g.creator_pubkey)}）`));
         }
@@ -252,11 +254,12 @@ export async function handleCommand(line) {
       }
       case '/members': {
         const groupId = parts[1] || state.currentGroupId;
-        if (!groupId) throw new Error('需要群组 ID');
+        if (!groupId) throw new Error(strings.ERR_NEED_GROUP_ID);
         const members = getMembers(groupId);
         if (members.length === 0) {
-          appendSystemMessage('暂无成员');
+          appendSystemMessage(strings.NO_GROUPS);
         } else {
+          appendSystemMessage(strings.MEMBER_LIST_TITLE);
           members.forEach(m => {
             const display = getDisplayNameWithSelf(m.pubkey, state.myPubkey, state.myNickname);
             appendSystemMessage(`  ${display}  （${m.role}）`);
@@ -266,24 +269,30 @@ export async function handleCommand(line) {
       }
       case '/msgs': {
         const groupId = parts[1] || state.currentGroupId;
-        if (!groupId) throw new Error('需要群组 ID');
+        if (!groupId) throw new Error(strings.ERR_MSGS_USAGE);
         const topicId = parts[2] || state.currentTopicId;
         const msgs = getMessages(groupId, topicId, 20);
         const symKey = state.groupKeys.get(groupId);
-        if (!symKey) { appendSystemMessage('无群组密钥'); break; }
+        if (!symKey) { appendSystemMessage(strings.ERROR_NO_GROUP_KEY); break; }
         if (msgs.length === 0) {
-          appendSystemMessage('暂无消息');
+          appendSystemMessage(strings.NO_MESSAGES);
         } else {
           for (const m of msgs.reverse()) {
             try {
               const plain = decryptMessageBody(m, symKey);
               const displayName = getDisplayNameWithSelf(m.author_pubkey, state.myPubkey, state.myNickname);
               const time = new Date(m.timestamp).toISOString().replace('T', ' ').slice(0, 19);
-              const isSelf = m.author_pubkey === state.myPubkey;
-              const formatted = formatMessage(displayName, plain, time, isSelf);
-              appendMessage(formatted);
+              if (m.type === 'file') {
+                const fileInfo = JSON.parse(plain);
+                const msgText = `{${time}} (${displayName}) 发送了文件：${fileInfo.filename} (${fileInfo.filesize} 字节) [ID: ${m.id}]`;
+                appendMessage(msgText);
+              } else {
+                const isSelf = m.author_pubkey === state.myPubkey;
+                const formatted = formatMessage(displayName, plain, time, isSelf);
+                appendMessage(formatted);
+              }
             } catch (e) {
-              appendSystemMessage('[无法解密]');
+              appendSystemMessage(strings.DECRYPT_FAIL);
             }
           }
         }
@@ -297,11 +306,11 @@ export async function handleCommand(line) {
           [ip, port] = arg.split(':');
           port = parseInt(port);
           state.transport._startHandshake(ip, port);
-          appendSystemMessage(`正在连接 ${ip}:${port}...`);
+          appendSystemMessage(formatString(strings.CONNECTION_ATTEMPT, { ip, port }));
           const timeout = setTimeout(() => {
             const key = `${ip}:${port}`;
             if (!state.transport.sessions.has(key) || !state.transport.sessions.get(key).established) {
-              appendSystemMessage(`连接 ${ip}:${port} 超时`);
+              appendSystemMessage(formatString(strings.CONNECTION_TIMEOUT, { ip, port }));
             }
           }, 10000);
           const handler = ({ ip: ip2, port: port2 }) => {
@@ -325,22 +334,22 @@ export async function handleCommand(line) {
         try {
           const ips = await getTailscaleIPs();
           if (ips.length) {
-            appendSystemMessage(`Tailscale IP: ${ips.join(', ')}`);
+            appendSystemMessage(formatString(strings.TAILSCALE_IP, { ips: ips.join(', ') }));
           } else {
-            appendSystemMessage('未检测到 Tailscale 网络（请确保已安装并登录 Tailscale）');
+            appendSystemMessage(strings.TAILSCALE_NOT_FOUND);
           }
         } catch (e) {
           if (e.message === 'NOT_INSTALLED') {
-            appendSystemMessage('Tailscale 未安装，请访问 https://tailscale.com/download 下载安装。');
+            appendSystemMessage(strings.TAILSCALE_NOT_INSTALLED);
           } else {
-            appendSystemMessage('获取 Tailscale IP 失败: ' + e.message);
+            appendSystemMessage(formatString(strings.TAILSCALE_ERROR, { msg: e.message }));
           }
         }
         break;
       }
       case '/nick': {
         if (parts.length === 1) {
-          appendSystemMessage(`当前昵称：${state.myNickname}`);
+          appendSystemMessage(formatString(strings.NICK_CURRENT, { nick: state.myNickname }));
           break;
         }
         if (parts.length === 2) {
@@ -349,14 +358,14 @@ export async function handleCommand(line) {
           updateUserNickname(state.myPubkey, newNick);
           const updateMsg = { type: 'NICK_UPDATE', pubkey: state.myPubkey, nickname: newNick };
           state.transport.broadcast(updateMsg, state.myPubkey);
-          appendSystemMessage(`昵称已设置为：${newNick}`);
+          appendSystemMessage(formatString(strings.NICK_SET, { nick: newNick }));
         } else if (parts.length === 3) {
           const target = parts[1];
           const nick = parts[2];
           setLocalNickname(target, nick);
-          appendSystemMessage(`已为 ${shortPub(target)} 设置本地昵称：${nick}`);
+          appendSystemMessage(formatString(strings.LOCAL_NICK_SET, { pubkey: shortPub(target), nick }));
         } else {
-          throw new Error('用法：/nick [<pubkey>] <昵称>');
+          throw new Error(strings.ERR_NICK_USAGE);
         }
         break;
       }
@@ -366,16 +375,16 @@ export async function handleCommand(line) {
         break;
       }
       case '/hash': {
-        appendSystemMessage(`你的完整公钥：${state.myPubkey}`);
+        appendSystemMessage(formatString(strings.HASH_DISPLAY, { pubkey: state.myPubkey }));
         break;
       }
       case '/renamegroup': {
         const newName = parts.slice(1).join(' ');
-        if (!newName) throw new Error('用法：/renamegroup <新名称>');
-        if (!state.currentGroupId) throw new Error('未选择群组');
-        if (!isAdmin(state.currentGroupId, state.myPubkey)) throw new Error('只有管理员可以重命名群组');
+        if (!newName) throw new Error(strings.ERR_RENAME_USAGE);
+        if (!state.currentGroupId) throw new Error(strings.ERR_NEED_TOPIC);
+        if (!isAdmin(state.currentGroupId, state.myPubkey)) throw new Error(strings.ERR_NOT_ADMIN);
         const g = getGroup(state.currentGroupId);
-        if (!g) throw new Error('群组不存在');
+        if (!g) throw new Error(strings.GROUP_NOT_EXIST);
         updateGroupName(state.currentGroupId, newName);
         const members = getMembers(state.currentGroupId);
         const renameMsg = { type: 'GROUP_RENAME', groupId: state.currentGroupId, newName };
@@ -384,7 +393,7 @@ export async function handleCommand(line) {
             state.transport.sendJSON(m.pubkey, renameMsg);
           }
         }
-        appendSystemMessage(`群组名称已更新为：${newName}`);
+        appendSystemMessage(formatString(strings.GROUP_RENAMED, { name: newName }));
         const g2 = getGroup(state.currentGroupId);
         updateStatus(g2.name, getTopicName(state.currentTopicId));
         broadcastStatus();
@@ -392,10 +401,10 @@ export async function handleCommand(line) {
       }
       case '/deletegroup': {
         const groupId = parts[1] || state.currentGroupId;
-        if (!groupId) throw new Error('用法：/deletegroup <群组ID>');
+        if (!groupId) throw new Error(strings.ERR_DELETE_GROUP_USAGE);
         const g = getGroup(groupId);
-        if (!g) throw new Error('群组不存在');
-        if (!isAdmin(groupId, state.myPubkey)) throw new Error('只有管理员可以删除群组');
+        if (!g) throw new Error(strings.GROUP_NOT_EXIST);
+        if (!isAdmin(groupId, state.myPubkey)) throw new Error(strings.ERR_NOT_ADMIN);
         const members = getMembers(groupId);
         const delMsg = { type: 'GROUP_DELETE', groupId };
         for (const m of members) {
@@ -410,79 +419,150 @@ export async function handleCommand(line) {
           state.currentTopicId = null;
           updateStatus('无', '无');
         }
-        appendSystemMessage(`群组 ${groupId} 已删除（已通知成员）`);
+        appendSystemMessage(formatString(strings.GROUP_DELETED, { id: groupId }));
         break;
       }
       case '/leave': {
-        if (!state.currentGroupId) throw new Error('未选择群组');
+        if (!state.currentGroupId) throw new Error(strings.ERR_NEED_TOPIC);
         const groupId = state.currentGroupId;
-        if (isAdmin(groupId, state.myPubkey)) throw new Error('管理员不能退出群组，请使用 /deletegroup 解散');
-        if (!isMember(groupId, state.myPubkey)) throw new Error('您不是该群组的成员');
-        const members = getMembers(groupId);
+        if (isAdmin(groupId, state.myPubkey)) throw new Error(strings.ERR_ADMIN_CANT_LEAVE);
+        if (!isMember(groupId, state.myPubkey)) throw new Error(strings.NOT_MEMBER);
+        
+        // 广播退出通知给所有在线节点（而不是仅数据库成员）
         const leaveMsg = { type: 'GROUP_LEAVE', groupId, leaver: state.myPubkey };
-        for (const m of members) {
-          if (m.pubkey !== state.myPubkey) {
-            state.transport.sendJSON(m.pubkey, leaveMsg);
-          }
-        }
+        state.transport.broadcast(leaveMsg, state.myPubkey);
+        
+        // 本地清理
         removeMember(groupId, state.myPubkey);
         state.currentGroupId = null;
         state.currentTopicId = null;
         updateStatus('无', '无');
-        appendSystemMessage(`您已退出群组 ${groupId}`);
+        appendSystemMessage(formatString(strings.GROUP_LEFT, { id: groupId }));
         break;
       }
       case '/deletetopic': {
         const input = parts[1];
-        if (!input) throw new Error('用法：/deletetopic <话题ID或名称>');
-        if (!state.currentGroupId) throw new Error('未选择群组');
+        if (!input) throw new Error(strings.ERR_TOPIC_USAGE);
+        if (!state.currentGroupId) throw new Error(strings.ERR_NEED_TOPIC);
         let topic = getTopic(input);
         let topicId = input;
         if (!topic) {
           const topics = getTopicsByGroup(state.currentGroupId);
           const matches = topics.filter(t => t.name === input);
-          if (matches.length === 0) throw new Error(`未找到话题 "${input}"`);
-          if (matches.length > 1) throw new Error(`话题名称 "${input}" 不唯一，请使用ID删除`);
+          if (matches.length === 0) throw new Error(formatString(strings.ERR_TOPIC_NOT_FOUND, { input }));
+          if (matches.length > 1) throw new Error(formatString(strings.ERR_TOPIC_NOT_UNIQUE, { input }));
           topic = matches[0];
           topicId = topic.id;
         }
-        if (!topic) throw new Error('话题不存在');
+        if (!topic) throw new Error(strings.GROUP_NOT_EXIST);
         const groupId = topic.group_id;
-        if (!isAdmin(groupId, state.myPubkey)) throw new Error('只有管理员可以删除话题');
+        if (!isAdmin(groupId, state.myPubkey)) throw new Error(strings.ERR_NOT_ADMIN);
         deleteTopic(topicId);
         if (state.currentTopicId === topicId) {
           const defaultTopic = getDefaultTopic(groupId);
           state.currentTopicId = defaultTopic.id;
-          appendSystemMessage(`已删除话题，切换到默认话题：${defaultTopic.name}`);
+          appendSystemMessage(formatString(strings.TOPIC_DELETED_SWITCH_DEFAULT, { name: defaultTopic.name }));
           const g = getGroup(groupId);
           updateStatus(g ? g.name : '未知', defaultTopic.name);
           broadcastStatus();
         } else {
-          appendSystemMessage(`已删除话题 ${topicId}`);
+          appendSystemMessage(formatString(strings.TOPIC_DELETED, { id: topicId }));
         }
         break;
       }
+      case '/sendfile': {
+        if (!state.currentGroupId) throw new Error(strings.ERR_NEED_TOPIC);
+        const filePath = parts.slice(1).join(' ');
+        if (!filePath) throw new Error(strings.ERR_NEED_FILE_PATH);
+        if (!fs.existsSync(filePath)) throw new Error(strings.ERR_FILE_NOT_EXIST);
+        const stats = fs.statSync(filePath);
+        const filename = path.basename(filePath);
+        const filedata = fs.readFileSync(filePath).toString('base64');
+        const symKey = state.groupKeys.get(state.currentGroupId);
+        if (!symKey) throw new Error(strings.ERROR_NO_GROUP_KEY);
+        const bodyObj = { filename, filesize: stats.size, filedata };
+        const bodyEncrypted = aesEncrypt(Buffer.from(JSON.stringify(bodyObj)), symKey);
+        const prev = getMessages(state.currentGroupId, state.currentTopicId, 1).map(m => m.id);
+        const msgObj = {
+          id: '',
+          prev_ids: prev,
+          author: state.myPubkey,
+          group_id: state.currentGroupId,
+          topic_id: state.currentTopicId,
+          type: 'file',
+          body_encrypted: JSON.stringify(bodyEncrypted),
+          timestamp: Date.now(),
+          sig: ''
+        };
+        const canonicalData = {
+          prev_ids: msgObj.prev_ids,
+          author: msgObj.author,
+          group_id: msgObj.group_id,
+          topic_id: msgObj.topic_id,
+          timestamp: msgObj.timestamp,
+          type: msgObj.type,
+          body_encrypted: msgObj.body_encrypted
+        };
+        const sig = sign(Buffer.from(JSON.stringify(canonicalData)), state.keyPair.secretKey);
+        msgObj.sig = toHex(sig);
+        msgObj.id = computeMessageId(msgObj);
+        const fullMsg = { type: 'NEW_MSG', message: msgObj };
+        const jsonStr = JSON.stringify(fullMsg);
+        const byteLen = Buffer.byteLength(jsonStr);
+        if (byteLen > UDP_MTU) {
+          appendSystemMessage(formatString(strings.FILE_TOO_LARGE, { size: stats.size, byteLen, mtu: UDP_MTU }));
+          break;
+        }
+        storeValidMessage(msgObj);
+        state.transport.broadcast({ type: 'NEW_MSG', message: msgObj }, state.myPubkey);
+        appendSystemMessage(formatString(strings.FILE_SENT, { filename, size: stats.size }));
+
+        const ackPromise = new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            state.pendingFileAcks.delete(msgObj.id);
+            reject(new Error('ACK timeout'));
+          }, 5000);
+          state.pendingFileAcks.set(msgObj.id, {
+            timeout,
+            resolve,
+            reject
+          });
+        });
+
+        try {
+          await ackPromise;
+          appendSystemMessage(formatString(strings.FILE_ACK_RECEIVED, { filename }));
+        } catch (e) {
+          appendSystemMessage(formatString(strings.FILE_SEND_TIMEOUT, { filename }));
+        }
+        break;
+      }
+      case '/download': {
+        const msgId = parts[1];
+        if (!msgId) throw new Error(strings.ERR_NEED_MSG_ID);
+        const pending = state.pendingFiles.get(msgId);
+        if (!pending) throw new Error(formatString(strings.FILE_DOWNLOAD_ERROR, { id: msgId }));
+        const filesDir = path.join(process.cwd(), 'files');
+        if (!fs.existsSync(filesDir)) fs.mkdirSync(filesDir, { recursive: true });
+        let savePath = path.join(filesDir, pending.filename);
+        let counter = 1;
+        const ext = path.extname(pending.filename);
+        const baseName = path.basename(pending.filename, ext);
+        while (fs.existsSync(savePath)) {
+          savePath = path.join(filesDir, `${baseName}_${counter}${ext}`);
+          counter++;
+        }
+        const fileBuffer = Buffer.from(pending.filedata, 'base64');
+        fs.writeFileSync(savePath, fileBuffer);
+        appendSystemMessage(formatString(strings.FILE_DOWNLOAD_SUCCESS, { path: savePath }));
+        state.pendingFiles.delete(msgId);
+        break;
+      }
       case '/help': {
-        appendSystemMessage('===== 命令帮助 =====');
-        appendSystemMessage('  /create <名称>            - 创建新群组');
-        appendSystemMessage('  /join <群组ID>            - 申请加入群组');
-        appendSystemMessage('  /use <群组ID>             - 切换到指定群组');
-        appendSystemMessage('  /topic <话题名>           - 切换/创建话题（"general" 切回默认）');
-        appendSystemMessage('  /approve <公钥/前缀> <群组ID> - 批准加入请求（管理员）');
-        appendSystemMessage('  /list                    - 列出所有群组');
-        appendSystemMessage('  /members <群组ID>         - 查看群组成员');
-        appendSystemMessage('  /msgs [群组ID] [话题ID]   - 显示最近20条消息');
-        appendSystemMessage('  /connect <IP> [端口]      - 手动连接对等节点');
-        appendSystemMessage('  /tailscale               - 显示本机 Tailscale IP');
-        appendSystemMessage('  /nick [<pubkey>] <昵称>  - 设置昵称');
-        appendSystemMessage('  /online [all|group]      - 显示在线用户');
-        appendSystemMessage('  /hash                    - 显示您的完整公钥');
-        appendSystemMessage('  /renamegroup <新名称>    - 重命名当前群组（管理员）');
-        appendSystemMessage('  /deletegroup <群组ID>    - 解散群组（管理员，会通知所有成员）');
-        appendSystemMessage('  /leave                   - 退出当前群组（非管理员）');
-        appendSystemMessage('  /deletetopic <ID或名称>  - 删除话题（管理员）');
-        appendSystemMessage('  /help                    - 显示此帮助');
-        appendSystemMessage('  /exit                    - 退出程序');
+        const helpLines = strings.HELP.split('\n');
+        for (const line of helpLines) {
+          appendRaw(line);
+        }
         break;
       }
       case '/exit': {
@@ -490,10 +570,10 @@ export async function handleCommand(line) {
         process.exit(0);
       }
       default: {
-        appendSystemMessage(`未知命令: ${cmd}`);
+        appendSystemMessage(formatString(strings.UNKNOWN_COMMAND, { cmd }));
       }
     }
   } catch(e) {
-    appendSystemMessage(`错误：${e.message}`);
+    appendSystemMessage(formatString(strings.ERROR_PREFIX, { msg: e.message }));
   }
 }

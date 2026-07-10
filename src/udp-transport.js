@@ -14,7 +14,7 @@ export class UDPTransport extends EventEmitter {
     this.port = 0;
     this.sessions = new Map();          // key: "ip:port" -> session
     this.peerAddresses = new Map();     // pubkey -> {ip, port}
-    this.pendingHandshakes = new Map(); // key: "ip:port" -> timeout
+    this.pendingHandshakes = new Map(); // key: "ip:port" -> { timeout, startTime }
     this._bind();
     this._startCleanupTimer();
     // 心跳定时器：每 30 秒发送 PING 保持活跃
@@ -103,11 +103,12 @@ export class UDPTransport extends EventEmitter {
     if (this.sessions.has(key) && this.sessions.get(key).established) return;
     if (this.pendingHandshakes.has(key)) return;
     info('UDPTransport', 'Starting handshake', { ip, port });
+    const startTime = Date.now();
     const timeout = setTimeout(() => {
       this.pendingHandshakes.delete(key);
       this.emit('handshake-timeout', { ip, port });
     }, HANDSHAKE_TIMEOUT);
-    this.pendingHandshakes.set(key, timeout);
+    this.pendingHandshakes.set(key, { timeout, startTime });
     const handshakeMsg = Buffer.concat([Buffer.from([0x01]), this.localX25519.publicKey]);
     this.socket.send(handshakeMsg, port, ip);
     debug('UDPTransport', 'Sent handshake packet', { ip, port });
@@ -135,14 +136,18 @@ export class UDPTransport extends EventEmitter {
           established: true
         };
         this.sessions.set(key, session);
-        if (this.pendingHandshakes.has(key)) {
-          clearTimeout(this.pendingHandshakes.get(key));
+        // 计算延迟（若为主动发起方）
+        let delay = undefined;
+        const pending = this.pendingHandshakes.get(key);
+        if (pending) {
+          delay = Date.now() - pending.startTime;
+          clearTimeout(pending.timeout);
           this.pendingHandshakes.delete(key);
         }
         const reply = Buffer.concat([Buffer.from([0x01]), this.localX25519.publicKey]);
         this.socket.send(reply, rinfo.port, rinfo.address);
-        info('UDPTransport', 'Handshake complete (incoming)', { ip: rinfo.address, port: rinfo.port });
-        this.emit('handshake-complete', { ip: rinfo.address, port: rinfo.port, session });
+        info('UDPTransport', 'Handshake complete (incoming)', { ip: rinfo.address, port: rinfo.port, delay });
+        this.emit('handshake-complete', { ip: rinfo.address, port: rinfo.port, session, delay });
       } catch (e) {
         error('UDPTransport', 'Handshake processing error', { error: e.message, from: key });
       }
@@ -182,7 +187,6 @@ export class UDPTransport extends EventEmitter {
         warn('UDPTransport', 'Invalid JSON in plaintext', { from: key, text: plaintext.toString() });
         return;
       }
-      // 忽略 PING 消息
       if (msg.type === 'PING') {
         debug('UDPTransport', 'Received PING, keepalive', { from: key });
         return;
@@ -236,7 +240,7 @@ export class UDPTransport extends EventEmitter {
   _startCleanupTimer() {
     setInterval(() => {
       const now = Date.now();
-      const timeout = 120000; // 延长至 120 秒，配合心跳
+      const timeout = 120000;
       for (const [key, session] of this.sessions) {
         if (now - session.lastSeen > timeout) {
           info('UDPTransport', 'Removing inactive session', { key });
