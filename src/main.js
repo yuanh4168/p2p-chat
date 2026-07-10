@@ -168,6 +168,24 @@ async function main() {
       debug('MAIN', 'Profile updated via transport event', { pubkey: shortPub(pubkey) });
     }
   });
+
+  // 监听握手超时事件（Bug-1）
+  transport.on('handshake-timeout', ({ ip, port }) => {
+    appendSystemMessage(`连接 ${ip}:${port} 超时`);
+  });
+
+  // 监听会话移除事件（Bug-8）
+  transport.on('session-removed', ({ pubkey, ip, port }) => {
+    if (pubkey) {
+      state.peerStatus.delete(pubkey);
+      debug('MAIN', 'Removed peer from status', { pubkey: shortPub(pubkey) });
+    }
+    // 更新状态栏
+    const g = state.currentGroupId ? getGroup(state.currentGroupId) : null;
+    const t = state.currentTopicId ? getTopic(state.currentTopicId) : null;
+    updateStatus(g ? g.name : '无', t ? t.name : '无');
+  });
+
   try {
     await transport.listen();
     info('MAIN', 'UDP transport ready', { port: transport.port });
@@ -317,20 +335,7 @@ async function main() {
 
   // 显示欢迎信息
   appendSystemMessage('===== P2P 聊天系统 (UDP) =====');
-  appendSystemMessage('命令列表：');
-  appendSystemMessage('  /create <群组名称>            - 创建新群组');
-  appendSystemMessage('  /join <群组ID>                - 申请加入群组');
-  appendSystemMessage('  /use <群组ID>                 - 切换到指定群组');
-  appendSystemMessage('  /topic <话题名称>             - 在当前群组创建/切换话题');
-  appendSystemMessage('  /approve <申请人公钥> <群组ID> - 批准加入请求（仅管理员）');
-  appendSystemMessage('  /list                        - 列出所有群组');
-  appendSystemMessage('  /members <群组ID>            - 查看群组成员');
-  appendSystemMessage('  /msgs [群组ID] [话题ID]      - 显示最近消息');
-  appendSystemMessage('  /connect <IP> [端口]         - 手动连接对等节点');
-  appendSystemMessage('  /tailscale                   - 显示本机 Tailscale IP');
-  appendSystemMessage('  /nick [<pubkey>] <昵称>      - 设置自己的昵称或为他人设置本地昵称');
-  appendSystemMessage('  /online [all|group]          - 显示在线用户（默认当前话题）');
-  appendSystemMessage('  /exit                        - 退出程序');
+  appendSystemMessage('输入 /help 查看命令帮助');
   appendSystemMessage('直接输入文本即可发送到当前群组/话题\n');
 
   // 窗口大小变化处理

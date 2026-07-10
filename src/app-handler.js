@@ -2,7 +2,8 @@ import { state } from './state.js';
 import {
   saveProfileRemote, getMessage, saveMessage, getLatestMessageIds,
   getGroup, addMember, isAdmin, addJoinRequest, saveGroup,
-  getTopic, getDefaultTopic, getMessages, getDisplayNameWithSelf
+  getTopic, getDefaultTopic, getMessages, getDisplayNameWithSelf,
+  deleteGroup, removeMember, updateGroupName
 } from './db.js';
 import { aesDecrypt, aesEncrypt, toHex, sign, fromHex } from './crypto.js';
 import { verifyMessage, computeMessageId, storeValidMessage, decryptMessageBody } from './message.js';
@@ -189,6 +190,46 @@ export function handleAppMessage(msg, session) {
         const { pubkey, nickname } = msg;
         if (pubkey && nickname) {
           saveProfileRemote(pubkey, nickname, null);
+        }
+        break;
+      }
+      // ---------- 新增群组管理消息 ----------
+      case 'GROUP_RENAME': {
+        const { groupId, newName } = msg;
+        if (groupId && newName) {
+          updateGroupName(groupId, newName);
+          appendSystemMessage(`群组 ${groupId} 已更名为：${newName}`);
+          if (state.currentGroupId === groupId) {
+            const g = getGroup(groupId);
+            updateStatus(g ? g.name : '未知', state.currentTopicId ? getTopicName(state.currentTopicId) : '无');
+          }
+        }
+        break;
+      }
+      case 'GROUP_DELETE': {
+        const { groupId } = msg;
+        if (groupId) {
+          // 删除本地群组
+          deleteGroup(groupId);
+          state.groupKeys.delete(groupId);
+          if (state.currentGroupId === groupId) {
+            state.currentGroupId = null;
+            state.currentTopicId = null;
+            updateStatus('无', '无');
+          }
+          appendSystemMessage(`群组 ${groupId} 已被管理员解散`);
+        }
+        break;
+      }
+      case 'GROUP_LEAVE': {
+        const { groupId, leaver } = msg;
+        if (groupId && leaver) {
+          // 仅当本地存在该群且该成员在成员列表中
+          if (getGroup(groupId)) {
+            removeMember(groupId, leaver);
+            appendSystemMessage(`${shortPub(leaver)} 已退出群组 ${groupId}`);
+            // 如果离开者是自己，但自己不会发送给自己，所以忽略
+          }
         }
         break;
       }

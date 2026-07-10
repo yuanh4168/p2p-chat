@@ -195,6 +195,9 @@ export function saveGroup(id, name, creator, encryptedKey) {
     [id, name, creator, JSON.stringify(encryptedKey), Date.now()]
   );
 }
+export function updateGroupName(groupId, newName) {
+  exec('UPDATE groups SET name = ? WHERE id = ?', [newName, groupId]);
+}
 export function updateGroupKey(id, encryptedObj) {
   exec('UPDATE groups SET symmetric_key_encrypted = ? WHERE id = ?', [JSON.stringify(encryptedObj), id]);
 }
@@ -204,12 +207,18 @@ export function getGroupKey(groupId, masterKey) {
   const obj = JSON.parse(row.symmetric_key_encrypted);
   return aesDecrypt(obj, masterKey);
 }
+export function deleteGroup(groupId) {
+  exec('DELETE FROM groups WHERE id = ?', [groupId]);
+}
 
 // ---------- 话题 ----------
 export function getTopic(id) { return get('SELECT * FROM topics WHERE id = ?', [id]); }
 export function getTopicsByGroup(groupId) { return all('SELECT * FROM topics WHERE group_id = ? ORDER BY created_at', [groupId]); }
 export function saveTopic(id, groupId, name) {
   exec('INSERT OR REPLACE INTO topics (id, group_id, name, created_at) VALUES (?,?,?,?)', [id, groupId, name, Date.now()]);
+}
+export function deleteTopic(topicId) {
+  exec('DELETE FROM topics WHERE id = ?', [topicId]);
 }
 export function getDefaultTopic(groupId) {
   const topics = getTopicsByGroup(groupId);
@@ -228,6 +237,12 @@ export function getMembers(groupId) { return all('SELECT pubkey, role FROM membe
 export function isAdmin(groupId, pubkey) {
   const row = get('SELECT role FROM members WHERE group_id = ? AND pubkey = ?', [groupId, pubkey]);
   return row && row.role === 'admin';
+}
+export function updateMemberRole(groupId, pubkey, role) {
+  exec('UPDATE members SET role = ? WHERE group_id = ? AND pubkey = ?', [role, groupId, pubkey]);
+}
+export function removeMember(groupId, pubkey) {
+  exec('DELETE FROM members WHERE group_id = ? AND pubkey = ?', [groupId, pubkey]);
 }
 
 // ---------- 加入请求 ----------
@@ -301,9 +316,9 @@ export function setLocalColor(pubkey, color) {
     [pubkey, color, Date.now()]
   );
 }
-export function getDisplayNameWithSelf(pubkey, myPubkey) {
+export function getDisplayNameWithSelf(pubkey, myPubkey, myNickname = null) {
   if (pubkey === myPubkey) {
-    return `User-${pubkey.slice(0, 6)}`;
+    return myNickname || `User-${pubkey.slice(0, 6)}`;
   }
   const p = getProfile(pubkey);
   if (p && p.local_nickname) return p.local_nickname;

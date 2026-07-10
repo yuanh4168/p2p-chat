@@ -4,7 +4,6 @@ import { createCipheriv, createDecipheriv } from 'crypto';
 import { deriveSharedSecret } from './crypto.js';
 import { UDP_MTU, HANDSHAKE_TIMEOUT, UDP_PORTS } from './config.js';
 import { debug, error, info, warn } from './logger.js';
-import chalk from 'chalk';  // 新增导入
 
 export class UDPTransport extends EventEmitter {
   constructor(localEd25519KeyPair, localX25519KeyPair) {
@@ -13,10 +12,20 @@ export class UDPTransport extends EventEmitter {
     this.localX25519 = localX25519KeyPair;
     this.socket = dgram.createSocket('udp4');
     this.port = 0;
-    this.sessions = new Map();
-    this.peerAddresses = new Map();
-    this.pendingHandshakes = new Map();
+    this.sessions = new Map();          // key: "ip:port" -> session
+    this.peerAddresses = new Map();     // pubkey -> {ip, port}
+    this.pendingHandshakes = new Map(); // key: "ip:port" -> timeout
     this._bind();
+    this._startCleanupTimer();
+    // 心跳定时器：每 30 秒发送 PING 保持活跃
+    this._heartbeatInterval = setInterval(() => {
+      for (const [key, session] of this.sessions) {
+        if (session.established) {
+          const [ip, port] = key.split(':');
+          this.sendTo(ip, parseInt(port), Buffer.from(JSON.stringify({ type: 'PING' })));
+        }
+      }
+    }, 30000);
     debug('UDPTransport', 'Transport created');
   }
 
@@ -96,8 +105,7 @@ export class UDPTransport extends EventEmitter {
     info('UDPTransport', 'Starting handshake', { ip, port });
     const timeout = setTimeout(() => {
       this.pendingHandshakes.delete(key);
-      // 用户可见的超时提示（使用 chalk）
-      console.log(chalk.red(`连接 ${ip}:${port} 超时`));
+      this.emit('handshake-timeout', { ip, port });
     }, HANDSHAKE_TIMEOUT);
     this.pendingHandshakes.set(key, timeout);
     const handshakeMsg = Buffer.concat([Buffer.from([0x01]), this.localX25519.publicKey]);
@@ -174,6 +182,11 @@ export class UDPTransport extends EventEmitter {
         warn('UDPTransport', 'Invalid JSON in plaintext', { from: key, text: plaintext.toString() });
         return;
       }
+      // 忽略 PING 消息
+      if (msg.type === 'PING') {
+        debug('UDPTransport', 'Received PING, keepalive', { from: key });
+        return;
+      }
       if (msg.pubkey) {
         session.pubkey = msg.pubkey;
         this.peerAddresses.set(msg.pubkey, { ip: rinfo.address, port: rinfo.port });
@@ -217,5 +230,29 @@ export class UDPTransport extends EventEmitter {
       const [ip, port] = key.split(':');
       this.sendTo(ip, parseInt(port), Buffer.from(JSON.stringify(json)));
     }
+  }
+
+  // ---------- 会话清理 ----------
+  _startCleanupTimer() {
+    setInterval(() => {
+      const now = Date.now();
+      const timeout = 120000; // 延长至 120 秒，配合心跳
+      for (const [key, session] of this.sessions) {
+        if (now - session.lastSeen > timeout) {
+          info('UDPTransport', 'Removing inactive session', { key });
+          const pubkey = session.pubkey;
+          this.sessions.delete(key);
+          if (pubkey) {
+            this.peerAddresses.delete(pubkey);
+            this.emit('session-removed', { pubkey, ip: key.split(':')[0], port: parseInt(key.split(':')[1]) });
+          }
+        }
+      }
+    }, 30000);
+  }
+
+  destroy() {
+    clearInterval(this._heartbeatInterval);
+    this.socket.close();
   }
 }

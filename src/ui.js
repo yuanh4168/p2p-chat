@@ -1,6 +1,7 @@
 import chalk from 'chalk';
 import { state } from './state.js';
 import { getGroup, getTopic } from './db.js';
+import { getTimeStr } from './utils.js';
 
 const ESC = '\x1b';
 const CSI = ESC + '[';
@@ -87,10 +88,8 @@ export function updateStatus(groupName, topicName) {
 
 // ---------- 完全重绘屏幕 ----------
 function fullRedraw() {
-  // 清空整个屏幕
   process.stdout.write(CLEAR + HOME);
 
-  // 重绘状态栏
   const g = state.currentGroupId ? getGroup(state.currentGroupId) : null;
   const t = state.currentTopicId ? getTopic(state.currentTopicId) : null;
   updateStatus(g ? g.name : '无', t ? t.name : '无');
@@ -98,12 +97,11 @@ function fullRedraw() {
   const availRows = termRows - 3;
   const maxWidth = termCols - 2;
 
-  // 生成所有消息行（带颜色）
   const allLines = [];
   for (const entry of messages) {
     let colorFn;
     if (entry.type === 'system') colorFn = chalk.gray;
-    else if (entry.type === 'command') colorFn = chalk.cyan;
+    else if (entry.type === 'command') colorFn = chalk.yellow;
     else if (entry.type === 'message') colorFn = entry.isSelf ? chalk.green : chalk.blue;
     const wrapped = wrapTextByWidth(entry.text, maxWidth);
     for (const line of wrapped) {
@@ -111,7 +109,6 @@ function fullRedraw() {
     }
   }
 
-  // 只显示最后 availRows 行
   const start = Math.max(0, allLines.length - availRows);
   const displayLines = allLines.slice(start);
 
@@ -120,7 +117,6 @@ function fullRedraw() {
     process.stdout.write(CLEAR_LINE);
     process.stdout.write(displayLines[i]);
   }
-  // 清空剩余行
   for (let i = displayLines.length; i < availRows; i++) {
     process.stdout.write(CUP(2 + i, 1));
     process.stdout.write(CLEAR_LINE);
@@ -145,12 +141,20 @@ export function appendMessage(text, isSelf = false) {
   fullRedraw();
 }
 
+// 系统消息自动添加时间戳
 export function appendSystemMessage(text) {
-  messages.push({ type: 'system', text });
+  const timeStr = getTimeStr();
+  messages.push({ type: 'system', text: `[${timeStr}] ${text}` });
   fullRedraw();
 }
 
+// 命令日志也添加时间戳（已在 commands.js 中加过，此处保留也可）
 export function appendCommandMessage(text) {
+  // 如果外部已加时间戳则直接使用，否则添加
+  if (!text.startsWith('[')) {
+    const timeStr = getTimeStr();
+    text = `[${timeStr}] ${text}`;
+  }
   messages.push({ type: 'command', text });
   fullRedraw();
 }
