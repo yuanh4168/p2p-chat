@@ -1,4 +1,4 @@
-// src/ui.js - 重写，支持多行输入、鼠标滚轮、光标点击定位
+// src/ui.js - 自适应窗口（实时读取终端尺寸）、无鼠标捕获、双缓冲、中文支持
 
 import chalk from 'chalk';
 import { state } from './state.js';
@@ -11,22 +11,16 @@ const CLEAR = `${CSI}2J`;
 const HOME = `${CSI}H`;
 const CUP = (r, c) => `${CSI}${r};${c}H`;
 const CLEAR_LINE = `${CSI}2K`;
-const CLEAR_SCREEN = `${CSI}3J`;
 
-// 终端尺寸
-let termRows = 0, termCols = 0;
+// ---------- 全局变量（由 render 实时更新） ----------
+let termRows = 0;
+let termCols = 0;
 
 // ---------- 状态 ----------
-const allMessages = [];          // 完整消息列表 { type, text, isSelf? }
-let scrollOffset = 0;            // 从顶部跳过的消息条数（用于滚动）
+const allMessages = [];
 let inputBuffer = '';
-let cursorPos = 0;              // 在 inputBuffer 中的索引
-let maxInputLength = 2000;      // 可配置
-
-let newMessageFlag = false;     // 是否有新消息在屏幕外
-
-// 是否启用鼠标跟踪
-let mouseEnabled = false;
+let cursorPos = 0;
+const maxInputLength = 2000;
 
 // ---------- 显示宽度计算 ----------
 function getDisplayWidth(str) {
@@ -50,7 +44,6 @@ function getPlainText(str) {
   return str.replace(/\x1b\[[0-9;]*m/g, '');
 }
 
-// 按显示宽度截断/换行
 function wrapTextByWidth(text, maxWidth) {
   const plain = getPlainText(text);
   const lines = [];
@@ -85,20 +78,21 @@ function wrapTextByWidth(text, maxWidth) {
   return lines;
 }
 
-// ---------- 输入行计算 ----------
-// 输入字符串按显示宽度拆分成多行，第一行带 "> " 前缀
+// ---------- 输入行拆分 ----------
 function computeInputLines(input, maxCols) {
   const prefix = '> ';
   const prefixWidth = getDisplayWidth(prefix);
   const firstLineMax = maxCols - prefixWidth;
-  if (firstLineMax < 1) return []; // 终端太窄
+  // 即使宽度不足，也强制返回至少一行
+  if (firstLineMax < 1) {
+    return [prefix + input.slice(0, 1)]; // 显示至少一个字符
+  }
 
   const plain = getPlainText(input);
   const lines = [];
   let remaining = input;
   let plainRemaining = plain;
   let lineCount = 0;
-  let pos = 0;
   while (plainRemaining.length > 0) {
     let maxLen;
     let prefixStr = '';
@@ -109,7 +103,6 @@ function computeInputLines(input, maxCols) {
       maxLen = maxCols;
       prefixStr = '';
     }
-    // 按显示宽度截取
     let width = 0;
     let idx = 0;
     let plainIdx = 0;
@@ -117,11 +110,9 @@ function computeInputLines(input, maxCols) {
     while (idx < remaining.length && width < maxLen) {
       const ch = remaining[idx];
       if (ch === '\x1b') {
-        // 跳过 ANSI 序列，它们不影响宽度
         let end = idx + 1;
         while (end < remaining.length && remaining[end] !== 'm') end++;
         if (end < remaining.length) {
-          // 保留 ANSI 序列
           linePlain += remaining.slice(idx, end + 1);
           idx = end + 1;
           continue;
@@ -135,7 +126,6 @@ function computeInputLines(input, maxCols) {
       idx++;
       plainIdx++;
     }
-    // 如果 idx 没有推进（可能是空格等），强制推进
     if (idx === 0 && remaining.length > 0) {
       linePlain += remaining[0];
       idx = 1;
@@ -147,29 +137,26 @@ function computeInputLines(input, maxCols) {
     lineCount++;
   }
   if (lines.length === 0) {
-    lines.push(prefix); // 空输入显示 "> "
+    lines.push(prefix);
   }
   return lines;
 }
 
-// 获取输入光标在屏幕上的行列位置（基于当前输入行）
+// 获取光标在屏幕上的行列
 function getInputCursorScreenPos(input, cursorPos, maxCols) {
   const lines = computeInputLines(input, maxCols);
-  // 计算光标在输入字符串中的位置
   let charCount = 0;
   let lineIndex = 0;
   let colInLine = 0;
-  let plainIndex = 0;
   const plain = getPlainText(input);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const prefix = i === 0 ? '> ' : '';
-    const linePlain = getPlainText(line).slice(prefix.length); // 去掉前缀
+    const linePlain = getPlainText(line).slice(prefix.length);
     const lineLen = linePlain.length;
     if (cursorPos <= charCount + lineLen) {
       lineIndex = i;
       const offset = cursorPos - charCount;
-      // 计算该偏移在行中的显示宽度（考虑前缀）
       const before = linePlain.slice(0, offset);
       const widthBefore = getDisplayWidth(prefix) + getDisplayWidth(before);
       colInLine = widthBefore;
@@ -178,30 +165,32 @@ function getInputCursorScreenPos(input, cursorPos, maxCols) {
     charCount += lineLen;
   }
   if (lineIndex >= lines.length) {
-    // 光标可能在末尾
     const lastLine = lines[lines.length - 1];
     const prefix = lines.length === 1 ? '> ' : '';
     const lastPlain = getPlainText(lastLine).slice(prefix.length);
     lineIndex = lines.length - 1;
     colInLine = getDisplayWidth(prefix) + getDisplayWidth(lastPlain);
   }
-  // 屏幕行：从底部向上数，第0行是最后一行
   const inputLineCount = lines.length;
-  const startRow = termRows - inputLineCount; // 输入区域起始行（0-indexed）
+  const startRow = termRows - inputLineCount;
   const row = startRow + lineIndex;
-  // 列是 1-indexed，colInLine 是从0开始的宽度
   const col = colInLine + 1;
   return { row, col };
 }
 
-// ---------- 渲染 ----------
+// ---------- 双缓冲渲染 ----------
 function render() {
-  if (!termRows || !termCols) return;
+  // 每次渲染实时读取终端尺寸
+  const rows = process.stdout.rows || 30;
+  const cols = process.stdout.columns || 80;
+  termRows = rows;
+  termCols = cols;
 
-  // 1. 清屏
-  process.stdout.write(CLEAR + HOME);
+  const out = [];
 
-  // 2. 状态行（第0行）
+  out.push(CLEAR + HOME);
+
+  // ---- 状态行（第1行） ----
   const g = state.currentGroupId ? getGroup(state.currentGroupId) : null;
   const t = state.currentTopicId ? getTopic(state.currentTopicId) : null;
   const groupName = g ? g.name : '无';
@@ -216,50 +205,46 @@ function render() {
     }
   }
   const statusLine = ` 群组: ${groupName}  话题: ${topicName}  连接: ${connected}  在线: ${online}`;
-  process.stdout.write(CUP(1, 1) + CLEAR_LINE + statusLine);
+  out.push(CUP(1, 1) + CLEAR_LINE + statusLine);
 
-  // 3. 计算输入区域占用的行数
+  // ---- 输入区域行数 ----
   const inputLines = computeInputLines(inputBuffer, termCols);
   const inputLineCount = inputLines.length;
 
-  // 4. 分隔线（在输入区域上方）
-  const separatorRow = termRows - inputLineCount - 1; // 0-indexed
+  // ---- 分隔线位置（0‑indexed） ----
+  const separatorRow = termRows - inputLineCount - 1; // 分隔线所在行（0‑indexed）
   if (separatorRow >= 1) {
-    process.stdout.write(CUP(separatorRow + 1, 1) + CLEAR_LINE);
-    const sep = '─'.repeat(termCols);
-    process.stdout.write(sep);
+    out.push(CUP(separatorRow + 1, 1) + CLEAR_LINE);
+    out.push('─'.repeat(termCols));
   }
 
-  // 5. 绘制输入区域
+  // ---- 绘制输入区域 ----
   for (let i = 0; i < inputLines.length; i++) {
     const row = termRows - inputLineCount + i;
-    process.stdout.write(CUP(row + 1, 1) + CLEAR_LINE + inputLines[i]);
+    out.push(CUP(row + 1, 1) + CLEAR_LINE + inputLines[i]);
   }
 
-  // 6. 绘制消息区域（在分隔线之上，状态行之下）
-  const msgStartRow = 2; // 状态行占第1行（1-indexed），所以消息从第2行开始
-  const msgEndRow = separatorRow; // 分隔线之前的行（1-indexed）
-  const msgAvailableRows = Math.max(0, msgEndRow - msgStartRow + 1);
+  // ---- 消息区域：从第2行到分隔线上一行 ----
+  const msgStartRow = 2; // 1‑indexed
+  const msgEndRow = separatorRow; // 1‑indexed，等于分隔线所在行的上一行（因为分隔线在 separatorRow+1 行）
+  const availableRows = Math.max(0, msgEndRow - msgStartRow + 1);
 
-  // 根据滚动偏移决定显示哪些消息
-  // allMessages 从旧到新
-  const totalMsgs = allMessages.length;
-  let startIndex = totalMsgs - msgAvailableRows - scrollOffset;
-  if (startIndex < 0) startIndex = 0;
-  const endIndex = Math.min(totalMsgs, startIndex + msgAvailableRows);
-  const visibleMsgs = allMessages.slice(startIndex, endIndex);
-
-  // 清空消息区域
+  // 清空消息区域（从第2行到 msgEndRow）
   for (let r = msgStartRow; r <= msgEndRow; r++) {
-    process.stdout.write(CUP(r, 1) + CLEAR_LINE);
+    out.push(CUP(r, 1) + CLEAR_LINE);
   }
+
+  // 获取要显示的消息（最新 availableRows 条）
+  const totalMsgs = allMessages.length;
+  const startIndex = Math.max(0, totalMsgs - availableRows);
+  const visibleMsgs = allMessages.slice(startIndex);
 
   // 绘制消息
   for (let i = 0; i < visibleMsgs.length; i++) {
     const msg = visibleMsgs[i];
     const row = msgStartRow + i;
+    if (row > msgEndRow) break;
     let text = msg.text;
-    // 应用颜色
     if (msg.type === 'message') {
       text = msg.isSelf ? chalk.green(text) : chalk.blue(text);
     } else if (msg.type === 'system') {
@@ -267,55 +252,31 @@ function render() {
     } else if (msg.type === 'command') {
       text = chalk.yellow(text);
     }
-    // 按宽度换行（可能多行）
-    const lines = wrapTextByWidth(text, termCols - 1);
-    for (let j = 0; j < lines.length && row + j <= msgEndRow; j++) {
-      process.stdout.write(CUP(row + j + 1, 1) + CLEAR_LINE + lines[j]);
+    const wrapped = wrapTextByWidth(text, termCols - 1);
+    for (let j = 0; j < wrapped.length && row + j <= msgEndRow; j++) {
+      out.push(CUP(row + j + 1, 1) + CLEAR_LINE + wrapped[j]);
     }
   }
 
-  // 7. 新消息提示（右下角）
-  if (newMessageFlag) {
-    // 判断是否在底部
-    const atBottom = (scrollOffset === 0);
-    if (!atBottom) {
-      const indicatorRow = msgEndRow;
-      const indicatorCol = termCols - 1;
-      process.stdout.write(CUP(indicatorRow, indicatorCol) + chalk.yellow('↓'));
-    }
-  }
-
-  // 8. 将光标定位到输入光标位置
+  // ---- 光标定位 ----
   const { row, col } = getInputCursorScreenPos(inputBuffer, cursorPos, termCols);
-  // 确保行列在有效范围内
   const finalRow = Math.min(row + 1, termRows);
   const finalCol = Math.min(col, termCols);
-  process.stdout.write(CUP(finalRow, finalCol));
+  out.push(CUP(finalRow, finalCol));
 
-  // 刷新输出
-  process.stdout.write('');
+  // 一次性写入
+  process.stdout.write(out.join(''));
 }
 
 // ---------- 对外 API ----------
 export function appendMessage(text, isSelf = false) {
   allMessages.push({ type: 'message', text, isSelf });
-  // 如果当前滚动偏移为0（即在底部），保持滚动到底部；否则标记新消息
-  if (scrollOffset === 0) {
-    // 保持滚动到底部，自动显示新消息
-  } else {
-    newMessageFlag = true;
-  }
   render();
 }
 
 export function appendSystemMessage(text) {
   const timeStr = getTimeStr();
   allMessages.push({ type: 'system', text: `[${timeStr}] ${text}` });
-  if (scrollOffset === 0) {
-    // 在底部
-  } else {
-    newMessageFlag = true;
-  }
   render();
 }
 
@@ -325,21 +286,11 @@ export function appendCommandMessage(text) {
     text = `[${timeStr}] ${text}`;
   }
   allMessages.push({ type: 'command', text });
-  if (scrollOffset === 0) {
-    // 在底部
-  } else {
-    newMessageFlag = true;
-  }
   render();
 }
 
 export function appendRaw(text) {
   allMessages.push({ type: 'raw', text });
-  if (scrollOffset === 0) {
-    // 在底部
-  } else {
-    newMessageFlag = true;
-  }
   render();
 }
 
@@ -347,23 +298,22 @@ export function formatMessage(displayName, text, time) {
   return `{${time}} (${displayName}) ${text}`;
 }
 
-// ---------- 输入处理 ----------
+// ---------- 键盘输入 ----------
+let onLineCallback = null;
+
 function handleKey(key) {
-  if (key === '\x03') { // Ctrl+C
+  if (key === '\x03') {
     process.exit(0);
     return;
   }
 
   if (key === '\r' || key === '\n') {
-    // 发送消息
     const text = inputBuffer.trim();
     if (text) {
-      // 通过回调发送
       if (onLineCallback) onLineCallback(text);
     }
     inputBuffer = '';
     cursorPos = 0;
-    newMessageFlag = false; // 发送后重置提示
     render();
     return;
   }
@@ -383,27 +333,18 @@ function handleKey(key) {
   if (key.startsWith('\x1b[')) {
     const code = key.slice(2);
     if (code === 'D') { // Left
-      if (cursorPos > 0) {
-        cursorPos--;
-        render();
-      }
+      if (cursorPos > 0) { cursorPos--; render(); }
       return;
     } else if (code === 'C') { // Right
-      if (cursorPos < inputBuffer.length) {
-        cursorPos++;
-        render();
-      }
+      if (cursorPos < inputBuffer.length) { cursorPos++; render(); }
       return;
     } else if (code === 'A') { // Up
-      // 移动到上一行（按显示宽度）
       const lines = computeInputLines(inputBuffer, termCols);
-      const plain = getPlainText(inputBuffer);
       let charCount = 0;
-      let lineStart = 0;
-      let lineEnd = 0;
       let foundLine = -1;
+      let lineStart = 0, lineEnd = 0;
       for (let i = 0; i < lines.length; i++) {
-        const linePlain = getPlainText(lines[i]).slice(i === 0 ? 2 : 0); // 去掉前缀
+        const linePlain = getPlainText(lines[i]).slice(i === 0 ? 2 : 0);
         const len = linePlain.length;
         if (cursorPos >= charCount && cursorPos <= charCount + len) {
           foundLine = i;
@@ -414,10 +355,8 @@ function handleKey(key) {
         charCount += len;
       }
       if (foundLine > 0) {
-        // 上一行
         const prevLineStart = charCount - getPlainText(lines[foundLine - 1]).slice(foundLine - 1 === 0 ? 2 : 0).length;
         const prevLineLen = getPlainText(lines[foundLine - 1]).slice(foundLine - 1 === 0 ? 2 : 0).length;
-        // 保持列位置
         const currentCol = cursorPos - lineStart;
         const targetCol = Math.min(currentCol, prevLineLen);
         cursorPos = prevLineStart + targetCol;
@@ -426,11 +365,9 @@ function handleKey(key) {
       return;
     } else if (code === 'B') { // Down
       const lines = computeInputLines(inputBuffer, termCols);
-      const plain = getPlainText(inputBuffer);
       let charCount = 0;
-      let lineStart = 0;
-      let lineEnd = 0;
       let foundLine = -1;
+      let lineStart = 0, lineEnd = 0;
       for (let i = 0; i < lines.length; i++) {
         const linePlain = getPlainText(lines[i]).slice(i === 0 ? 2 : 0);
         const len = linePlain.length;
@@ -452,90 +389,12 @@ function handleKey(key) {
       }
       return;
     }
-    // 其他 escape 序列忽略
     return;
   }
 
-  // 鼠标事件（escape sequence: \x1b[M...）
-  if (key.startsWith('\x1b[M')) {
-    // 解析鼠标事件
-    const bytes = key.slice(3);
-    if (bytes.length >= 3) {
-      const b = bytes.charCodeAt(0);
-      const x = bytes.charCodeAt(1) - 32;
-      const y = bytes.charCodeAt(2) - 32;
-      const button = b & 0x03;
-      const isWheel = (b & 0x40) !== 0; // 高位标志
-      if (isWheel) {
-        const delta = (button === 0) ? -1 : (button === 1 ? 1 : 0);
-        if (delta !== 0) {
-          // 滚轮滚动消息区域
-          const totalMsgs = allMessages.length;
-          const inputLines = computeInputLines(inputBuffer, termCols);
-          const inputLineCount = inputLines.length;
-          const separatorRow = termRows - inputLineCount - 1;
-          const msgStartRow = 2;
-          const msgEndRow = separatorRow;
-          const msgAvailableRows = Math.max(0, msgEndRow - msgStartRow + 1);
-          const maxScroll = Math.max(0, totalMsgs - msgAvailableRows);
-          let newOffset = scrollOffset - delta;
-          if (newOffset < 0) newOffset = 0;
-          if (newOffset > maxScroll) newOffset = maxScroll;
-          if (newOffset !== scrollOffset) {
-            scrollOffset = newOffset;
-            // 如果滚动到了底部，清除新消息标志
-            if (scrollOffset === 0) newMessageFlag = false;
-            render();
-          }
-        }
-      } else {
-        // 鼠标点击，用于定位光标
-        // 检查点击是否在输入区域
-        const inputLines = computeInputLines(inputBuffer, termCols);
-        const inputLineCount = inputLines.length;
-        const startRow = termRows - inputLineCount; // 0-indexed
-        const endRow = termRows - 1;
-        if (y >= startRow && y <= endRow) {
-          const lineIndex = y - startRow;
-          const lineStr = inputLines[lineIndex] || '';
-          const prefix = lineIndex === 0 ? '> ' : '';
-          const prefixWidth = getDisplayWidth(prefix);
-          const plainLine = getPlainText(lineStr).slice(prefix.length);
-          // 计算点击位置对应的字符索引
-          let col = x - 1; // 0-indexed
-          // 减去前缀宽度
-          if (col < prefixWidth) col = 0;
-          else col -= prefixWidth;
-          // 找到该列对应的字符位置
-          let charOffset = 0;
-          let width = 0;
-          for (let i = 0; i < plainLine.length; i++) {
-            const ch = plainLine[i];
-            const w = getDisplayWidth(ch);
-            if (width + w / 2 > col) break;
-            width += w;
-            charOffset++;
-          }
-          // 计算全局位置
-          let globalPos = 0;
-          for (let i = 0; i < lineIndex; i++) {
-            const prevLine = inputLines[i];
-            const prevPlain = getPlainText(prevLine).slice(i === 0 ? 2 : 0);
-            globalPos += prevPlain.length;
-          }
-          globalPos += charOffset;
-          cursorPos = Math.min(globalPos, inputBuffer.length);
-          render();
-        }
-      }
-    }
-    return;
-  }
-
-  // 普通字符输入
-  if (key.length === 1 && key >= ' ') {
+  // 普通字符（中文等）
+  if (key.length > 0 && key >= ' ') {
     if (inputBuffer.length >= maxInputLength) {
-      // 提示用户超限，可以显示一条系统消息
       appendSystemMessage(`已达到最大输入长度 ${maxInputLength} 字符`);
       return;
     }
@@ -547,8 +406,6 @@ function handleKey(key) {
   }
 }
 
-let onLineCallback = null;
-
 export function setupInput(onLine) {
   onLineCallback = onLine;
   process.stdin.removeAllListeners('data');
@@ -556,13 +413,7 @@ export function setupInput(onLine) {
   process.stdin.setEncoding('utf8');
   process.stdin.resume();
 
-  // 启用鼠标跟踪
-  if (!mouseEnabled) {
-    process.stdout.write(`${CSI}?1000h`); // 启用鼠标事件
-    process.stdout.write(`${CSI}?1002h`); // 启用鼠标移动（可选）
-    mouseEnabled = true;
-  }
-
+  // 不启用任何鼠标捕获，让终端处理选择
   process.stdin.on('data', (chunk) => {
     const key = chunk.toString();
     handleKey(key);
@@ -570,33 +421,20 @@ export function setupInput(onLine) {
 }
 
 export function restoreTerminal() {
-  if (mouseEnabled) {
-    process.stdout.write(`${CSI}?1000l`);
-    process.stdout.write(`${CSI}?1002l`);
-    mouseEnabled = false;
-  }
   process.stdout.write(`${CSI}?1049l`);
 }
 
-// ---------- 初始化 ----------
 export function initTerminal() {
-  termRows = process.stdout.rows || 30;
-  termCols = process.stdout.columns || 80;
+  // 切换到备用屏幕
   process.stdout.write(`${CSI}?1049h`);
   process.stdout.write(CLEAR + HOME);
-  process.stdout.write(`${CSI}2;${termRows - 1}r`);
   render();
 }
 
 export function onResize() {
-  termRows = process.stdout.rows;
-  termCols = process.stdout.columns;
-  process.stdout.write(`${CSI}2;${termRows - 1}r`);
   render();
 }
 
-// 导出更新状态（供外部调用）
 export function updateStatus(groupName, topicName) {
-  // 由 render 自己获取状态，这里可以触发重绘
   render();
 }
